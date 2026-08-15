@@ -51,6 +51,24 @@ func TestLoadLogic(t *testing.T) {
 	}
 }
 
+func TestLoadDockerYAML(t *testing.T) {
+	t.Parallel()
+	gw, err := LoadHTTP2GW(filepath.Join("..", "..", "configs", "http2gw.docker.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gw.HTTP.Listen != "0.0.0.0" || gw.UDP.Listen != "0.0.0.0" {
+		t.Fatalf("http2gw docker listen = %s / %s", gw.HTTP.Listen, gw.UDP.Listen)
+	}
+	lg, err := LoadLogic(filepath.Join("..", "..", "configs", "logic.docker.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lg.UDP.Listen != "0.0.0.0" || lg.Gateway.Host != "http2gw" || lg.Node.IP != "logic" {
+		t.Fatalf("logic docker cfg = %+v", lg)
+	}
+}
+
 func TestLoadLogicDevYAMLUnchanged(t *testing.T) {
 	t.Parallel()
 	cfg, err := LoadLogic(filepath.Join("..", "..", "configs", "logic.dev.yaml"))

@@ -1,0 +1,17 @@
+# Build context — runtime image chỉ nhận binary + YAML docker từ Dockerfile COPY
+.git
+.github
+.cursor
+.vscode
+*.exe
+*.test
+*.out
+bin/
+coverage.*
+tools/
+document/
+*.md
+.env
+.env.*
+*.local.yaml
+configs/*.dev.yaml
