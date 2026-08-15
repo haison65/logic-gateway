@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package logicgateway.v1;
+
+option go_package = "github.com/haison65/logic-gateway/proto/gen/go;logicgatewayv1";
+
+// DataRequest mang payload nghiệp vụ từ Gateway sang Logic (hoặc ngược lại).
+message DataRequest {
+  uint32 message_id = 1;
+  string session_id = 2;
+  bytes payload = 3;
+}
+
+// DataResponse là kết quả xử lý tương ứng với DataRequest.
+message DataResponse {
+  uint32 message_id = 1;
+  uint32 status = 2;
+  bytes payload = 3;
+}

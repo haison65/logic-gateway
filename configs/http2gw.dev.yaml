@@ -1,0 +1,21 @@
+node:
+  node_id: 1
+  instance_id: http2gw-dev
+
+http:
+  listen: 127.0.0.1
+  port: 8080
+
+udp:
+  listen: 127.0.0.1
+  port: 9000
+
+heartbeat:
+  interval: 1000ms
+  timeout: 3000ms
+
+transaction:
+  timeout: 5000ms
+
+routing:
+  strategy: consistent_hash

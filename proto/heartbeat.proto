@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package logicgateway.v1;
+
+option go_package = "github.com/haison65/logic-gateway/proto/gen/go;logicgatewayv1";
+
+// HeartbeatRequest báo trạng thái sống, tải và số giao dịch đang xử lý.
+message HeartbeatRequest {
+  uint32 node_id = 1;
+  uint64 sequence = 2;
+  uint64 timestamp_ms = 3;
+  uint32 load = 4;
+  uint32 active_transaction = 5;
+}
+
+// HeartbeatResponse xác nhận đã nhận heartbeat, kèm sequence và timestamp.
+message HeartbeatResponse {
+  uint64 sequence = 1;
+  uint64 timestamp_ms = 2;
+}

@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package logicgateway.v1;
+
+option go_package = "github.com/haison65/logic-gateway/proto/gen/go;logicgatewayv1";
+
+// MessageType xác định phần body đang được điền trong Envelope.
+enum MessageType {
+  MESSAGE_TYPE_UNKNOWN = 0;
+
+  MESSAGE_TYPE_REGISTER_REQUEST = 1;
+  MESSAGE_TYPE_REGISTER_RESPONSE = 2;
+
+  MESSAGE_TYPE_HEARTBEAT_REQUEST = 3;
+  MESSAGE_TYPE_HEARTBEAT_RESPONSE = 4;
+
+  MESSAGE_TYPE_DATA_REQUEST = 10;
+  MESSAGE_TYPE_DATA_RESPONSE = 11;
+
+  MESSAGE_TYPE_ERROR = 100;
+}
+
+// NodeType phân loại vai trò của node (HTTP2GW hoặc Logic).
+enum NodeType {
+  NODE_TYPE_UNKNOWN = 0;
+  NODE_TYPE_HTTP2GW = 1;
+  NODE_TYPE_LOGIC = 2;
+}
+
+// NodeState mô tả vòng đời sức khỏe của một node Logic.
+enum NodeState {
+  NODE_STATE_UNKNOWN = 0;
+  NODE_STATE_INIT = 1;
+  NODE_STATE_REGISTERED = 2;
+  NODE_STATE_ACTIVE = 3;
+  NODE_STATE_SUSPECT = 4;
+  NODE_STATE_DEAD = 5;
+}

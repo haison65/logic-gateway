@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package logicgateway.v1;
+
+option go_package = "github.com/haison65/logic-gateway/proto/gen/go;logicgatewayv1";
+
+import "common.proto";
+import "register.proto";
+import "heartbeat.proto";
+import "data.proto";
+import "error.proto";
+
+// Envelope là payload của một datagram UDP giữa HTTP2GW và Logic.
+message Envelope {
+  uint32 version = 1;
+  MessageType type = 2;
+
+  uint32 source_node_id = 3;
+  uint32 destination_node_id = 4;
+
+  uint64 transaction_id = 5;
+  uint64 timestamp_ms = 6;
+
+  string trace_id = 7;
+
+  oneof body {
+    RegisterRequest register_request = 20;
+    RegisterResponse register_response = 21;
+
+    HeartbeatRequest heartbeat_request = 30;
+    HeartbeatResponse heartbeat_response = 31;
+
+    DataRequest data_request = 40;
+    DataResponse data_response = 41;
+
+    ErrorMessage error = 50;
+  }
+}

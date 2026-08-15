@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package logicgateway.v1;
+
+option go_package = "github.com/haison65/logic-gateway/proto/gen/go;logicgatewayv1";
+
+import "common.proto";
+
+// ServiceCapability mô tả một dịch vụ Logic và các loại message nó xử lý.
+message ServiceCapability {
+  uint32 service_id = 1;
+  string service_name = 2;
+  repeated uint32 message_types = 3;
+}
+
+// RegisterRequest là thông tin Logic gửi khi đăng ký với HTTP2GW.
+message RegisterRequest {
+  uint32 node_id = 1;
+  NodeType node_type = 2;
+  string instance_id = 3;
+  string ip = 4;
+  uint32 port = 5;
+  repeated ServiceCapability services = 10;
+}
+
+// RegisterResponse là kết quả HTTP2GW trả về sau khi nhận đăng ký.
+message RegisterResponse {
+  bool accepted = 1;
+  uint32 assigned_node_id = 2;
+  string message = 3;
+}
