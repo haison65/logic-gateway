@@ -15,3 +15,5 @@ document/
 .env.*
 *.local.yaml
 configs/*.dev.yaml
+docker-compose.yml
+.dockerignore

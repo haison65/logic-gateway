@@ -19,7 +19,8 @@ Module: `github.com/haison65/logic-gateway` (Go 1.26).
 | File                                                                                           | Nội dung                                      |
 | ---------------------------------------------------------------------------------------------- | --------------------------------------------- |
 | [document/HTTP2GW_Logic_UDP_Protobuf_Design.md](document/HTTP2GW_Logic_UDP_Protobuf_Design.md) | Thiết kế (SoT)                                |
-| [document/guide_setup.md](document/guide_setup.md)                                             | Dựng môi trường, E2E, metrics, lỗi thường gặp |
+| [document/docker.md](document/docker.md) | Compose, cổng, stop, troubleshooting |
+| [document/guide_setup.md](document/guide_setup.md) | Dựng môi trường, E2E host, metrics |
 
 
 
@@ -127,24 +128,12 @@ Ctrl+C: client → logic → http2gw. Cổng bị chiếm trên Windows: `netsta
 
 ## Docker Compose (HTTP2GW + Logic)
 
-Hai container, mạng `logic-gateway-app`. DNS: `http2gw`, `logic`. YAML image: `configs/*.docker.yaml`. **Không** dùng `*.dev.yaml` trong Compose.
-
-Publish host: **8080/tcp** thôi. UDP 9000/9100 ở mạng nội bộ (host không cần UDP).
-
-Cổng 8080 trên máy phải trống (tắt `go run` / container `lg-http2gw`).
+Chi tiết: [document/docker.md](document/docker.md). Tóm tắt:
 
 ```powershell
-docker compose up --build
-```
-
-Terminal khác, đợi log Logic `logic đã đăng ký` (~1s HEARTBEAT → ACTIVE):
-
-```powershell
+docker compose up --build -d
 go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -session-id sess-1 -body hello
+docker compose down
 ```
 
-Kỳ vọng: `proto: HTTP/2`, `status: 200`, `body: hello`. Dừng: Ctrl+C compose.
-
-Chạy tay từng image (không mạng chung) vẫn 503 — dùng Compose cho E2E Docker.
-
-Localhost không Docker: vẫn `configs/*.dev.yaml` + `go run` như mục trên.
+Publish host chỉ **8080/tcp**. UDP 9000/9100 nội bộ. Localhost không Docker: `*.dev.yaml` + `go run`.

@@ -343,18 +343,9 @@ Không cần mục này để chạy `cmd/client` echo local.
 
 ## 9. Docker Compose (hai container)
 
-Cùng vòng E2E, không dùng `*.dev.yaml`. Mạng `logic-gateway-app`, DNS `http2gw` / `logic`. Publish host `8080/tcp`. UDP 9000/9100 không publish.
-
-8080 trên host phải trống. Tắt `go run` local và container lẻ `lg-http2gw`.
+Xem [docker.md](docker.md): start/stop, cổng publish vs nội bộ, logs, tải, troubleshooting (DNS, REGISTER, DEAD/503, port 8080).
 
 ```powershell
-docker compose up --build
-```
-
-Đợi log `logic đã đăng ký`, rồi:
-
-```powershell
+docker compose up --build -d
 go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -session-id sess-1 -body hello
 ```
-
-Kỳ vọng HTTP 200, body `hello`. Chi tiết: `README.md` mục Docker Compose.
