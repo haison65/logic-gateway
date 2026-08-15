@@ -125,22 +125,26 @@ document/
 
 Ctrl+C: client → logic → http2gw. Cổng bị chiếm trên Windows: `netstat -ano | findstr "8080 9000 9100"` rồi `Stop-Process -Id <PID> -Force`.
 
-## Docker images (chưa Compose)
+## Docker Compose (HTTP2GW + Logic)
 
-Localhost vẫn dùng `*.dev.yaml` trên host. Image dùng `configs/*.docker.yaml` (listen `0.0.0.0`; Logic `gateway.host: http2gw`, `node.ip: logic`).
+Hai container, mạng `logic-gateway-app`. DNS: `http2gw`, `logic`. YAML image: `configs/*.docker.yaml`. **Không** dùng `*.dev.yaml` trong Compose.
 
-```powershell
-docker build --target http2gw -t logic-gateway/http2gw:local .
-docker build --target logic -t logic-gateway/logic:local .
-```
+Publish host: **8080/tcp** thôi. UDP 9000/9100 ở mạng nội bộ (host không cần UDP).
 
-Host đang dùng 8080 thì map cổng khác, client **cùng lệnh localhost**, chỉ đổi `-addr`:
+Cổng 8080 trên máy phải trống (tắt `go run` / container `lg-http2gw`).
 
 ```powershell
-docker run --rm -p 18080:8080 -p 19000:9000/udp logic-gateway/http2gw:local
-go run ./cmd/client -addr http://127.0.0.1:18080 -message-id 1001 -session-id sess-1 -body hello
+docker compose up --build
 ```
 
-Cổng 8080 trống: `-p 8080:8080` và bỏ `-addr` (mặc định `http://127.0.0.1:8080`).
+Terminal khác, đợi log Logic `logic đã đăng ký` (~1s HEARTBEAT → ACTIVE):
 
-Chưa Compose: Logic không REGISTER vào GW trong Docker → client thường **503**. Echo 200 cần mạng chung (phase sau) hoặc vẫn chạy logic+gw bằng `*.dev.yaml` trên host.
+```powershell
+go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -session-id sess-1 -body hello
+```
+
+Kỳ vọng: `proto: HTTP/2`, `status: 200`, `body: hello`. Dừng: Ctrl+C compose.
+
+Chạy tay từng image (không mạng chung) vẫn 503 — dùng Compose cho E2E Docker.
+
+Localhost không Docker: vẫn `configs/*.dev.yaml` + `go run` như mục trên.

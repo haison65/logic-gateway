@@ -1,0 +1,29 @@
+services:
+  http2gw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: http2gw
+    image: logic-gateway/http2gw:local
+    hostname: http2gw
+    ports:
+      - "8080:8080"
+    networks:
+      - app
+
+  logic:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: logic
+    image: logic-gateway/logic:local
+    hostname: logic
+    depends_on:
+      - http2gw
+    networks:
+      - app
+
+networks:
+  app:
+    driver: bridge
+    name: logic-gateway-app
