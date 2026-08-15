@@ -6,10 +6,18 @@ services:
       target: http2gw
     image: logic-gateway/http2gw:local
     hostname: http2gw
+    init: true
+    stop_grace_period: 10s
+    command: ["-config", "/configs/http2gw.yaml", "-debug=false"]
     ports:
-      - "8080:8080"
+      - "8080:8080/tcp"
     networks:
       - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   logic:
     build:
@@ -18,10 +26,18 @@ services:
       target: logic
     image: logic-gateway/logic:local
     hostname: logic
+    init: true
+    stop_grace_period: 10s
+    command: ["-config", "/configs/logic.yaml", "-debug=false"]
     depends_on:
       - http2gw
     networks:
       - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   app:
