@@ -11,6 +11,7 @@ import (
 
 	"github.com/haison65/logic-gateway/internal/config"
 	"github.com/haison65/logic-gateway/internal/logger"
+	"github.com/haison65/logic-gateway/internal/netaddr"
 	"github.com/haison65/logic-gateway/internal/protocol"
 	"github.com/haison65/logic-gateway/internal/transport/udp"
 	pb "github.com/haison65/logic-gateway/proto/gen/go"
@@ -58,19 +59,28 @@ func Run(ctx context.Context, cfg config.Logic, log *zap.Logger) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	gwIP := net.ParseIP(cfg.Gateway.Host)
-	if gwIP == nil {
-		return fmt.Errorf("gateway host %q", cfg.Gateway.Host)
+	gwAddr, err := netaddr.ResolveUDPAddr(ctx, cfg.Gateway.Host, cfg.Gateway.Port)
+	if err != nil {
+		return fmt.Errorf("gateway.host: %w", err)
 	}
-	gwAddr := &net.UDPAddr{IP: gwIP, Port: cfg.Gateway.Port}
 
 	local, ok := conn.LocalAddr().(*net.UDPAddr)
 	if !ok || local == nil {
 		return fmt.Errorf("logic local UDP address is invalid")
 	}
-	advertiseIP := cfg.AdvertiseIP()
+	advertiseHost := cfg.AdvertiseHost()
+	advIP, err := netaddr.ResolveIP(ctx, advertiseHost)
+	if err != nil {
+		return fmt.Errorf("node advertise: %w", err)
+	}
+	advertiseIP := advIP.String()
 	advertisePort := uint32(local.Port)
-	log.Info("logic đang lắng nghe UDP", zap.Stringer("addr", local), zap.String("advertise", net.JoinHostPort(advertiseIP, fmt.Sprintf("%d", advertisePort))))
+	log.Info("logic đang lắng nghe UDP",
+		zap.Stringer("addr", local),
+		zap.String("advertise_host", advertiseHost),
+		zap.String("advertise", net.JoinHostPort(advertiseIP, fmt.Sprintf("%d", advertisePort))),
+		zap.String("gateway", gwAddr.String()),
+	)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

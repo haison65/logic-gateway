@@ -2,10 +2,10 @@ package config
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"strings"
 
+	"github.com/haison65/logic-gateway/internal/netaddr"
 	"gopkg.in/yaml.v3"
 )
 
@@ -79,8 +79,11 @@ func (c Logic) Validate() error {
 	if c.UDP.Port < 0 || c.UDP.Port > 65535 {
 		return fmt.Errorf("udp.port %d out of range", c.UDP.Port)
 	}
-	if net.ParseIP(c.Gateway.Host) == nil {
-		return fmt.Errorf("gateway.host %q is not a valid IP", c.Gateway.Host)
+	if _, err := netaddr.ParseHost(c.Gateway.Host); err != nil {
+		return fmt.Errorf("gateway.host: %w", err)
+	}
+	if netaddr.IsUnspecified(c.Gateway.Host) {
+		return fmt.Errorf("gateway.host %q is unspecified; use a reachable host or IP", c.Gateway.Host)
 	}
 	if c.Gateway.Port <= 0 || c.Gateway.Port > 65535 {
 		return fmt.Errorf("gateway.port %d out of range", c.Gateway.Port)
@@ -88,8 +91,13 @@ func (c Logic) Validate() error {
 	if c.Heartbeat.Interval.Duration() <= 0 {
 		return fmt.Errorf("heartbeat.interval must be > 0")
 	}
-	if ip := strings.TrimSpace(c.Node.IP); ip != "" && net.ParseIP(ip) == nil {
-		return fmt.Errorf("node.ip %q is not a valid IP", c.Node.IP)
+	if ip := strings.TrimSpace(c.Node.IP); ip != "" {
+		if _, err := netaddr.ParseHost(ip); err != nil {
+			return fmt.Errorf("node.ip: %w", err)
+		}
+		if netaddr.IsUnspecified(ip) {
+			return fmt.Errorf("node.ip %q is unspecified; advertise a reachable address", ip)
+		}
 	}
 	for i, svc := range c.Services {
 		if svc.ServiceID == 0 {
@@ -99,14 +107,22 @@ func (c Logic) Validate() error {
 	return nil
 }
 
-// AdvertiseIP là địa chỉ Logic khai báo khi REGISTER (gateway dùng để gửi DATA).
-func (c Logic) AdvertiseIP() string {
+// AdvertiseHost là địa chỉ Logic đưa vào REGISTER (sau khi resolve thành IP literal).
+// Ưu tiên node.ip (IP hoặc hostname). Không dùng udp.listen khi listen là 0.0.0.0.
+func (c Logic) AdvertiseHost() string {
 	if ip := strings.TrimSpace(c.Node.IP); ip != "" {
 		return ip
 	}
 	host := strings.TrimSpace(c.UDP.Listen)
-	if ip := net.ParseIP(host); ip != nil && !ip.IsUnspecified() {
-		return host
+	if host != "" && !netaddr.IsUnspecified(host) {
+		if _, err := netaddr.ParseHost(host); err == nil {
+			return host
+		}
 	}
 	return "127.0.0.1"
+}
+
+// AdvertiseIP giữ tên cũ: cùng giá trị AdvertiseHost (có thể là hostname trước resolve).
+func (c Logic) AdvertiseIP() string {
+	return c.AdvertiseHost()
 }

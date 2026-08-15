@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/haison65/logic-gateway/internal/netaddr"
 	"gopkg.in/yaml.v3"
 )
 
@@ -105,6 +106,11 @@ func (c *HTTP2GW) applyDefaults() {
 func (c HTTP2GW) Validate() error {
 	if c.Node.NodeID == 0 {
 		return fmt.Errorf("node.node_id must be > 0")
+	}
+	if ip := strings.TrimSpace(c.Node.IP); ip != "" {
+		if _, err := netaddr.ParseHost(ip); err != nil {
+			return fmt.Errorf("node.ip: %w", err)
+		}
 	}
 	if c.HTTP.Port < 0 || c.HTTP.Port > 65535 {
 		return fmt.Errorf("http.port %d out of range", c.HTTP.Port)

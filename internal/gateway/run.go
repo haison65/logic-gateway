@@ -16,6 +16,7 @@ import (
 	"github.com/haison65/logic-gateway/internal/httpsrv"
 	"github.com/haison65/logic-gateway/internal/logger"
 	"github.com/haison65/logic-gateway/internal/metrics"
+	"github.com/haison65/logic-gateway/internal/netaddr"
 	"github.com/haison65/logic-gateway/internal/outbound"
 	"github.com/haison65/logic-gateway/internal/registration"
 	"github.com/haison65/logic-gateway/internal/registry"
@@ -154,12 +155,17 @@ func newStrategy(name string) router.Strategy {
 // §6 yêu cầu "gửi REGISTER" khi start nhưng không nêu đích UDP (Logic gửi tới gateway).
 // Không invent peer/mesh: đăng ký semantic NODE_TYPE_HTTP2GW vào cùng Registry.
 func registerSelf(reg *registration.Service, cfg config.HTTP2GW, conn udp.Transport) error {
-	ip := strings.TrimSpace(cfg.Node.IP)
-	if ip == "" || ip == "0.0.0.0" {
-		ip = strings.TrimSpace(cfg.UDP.Listen)
+	host := strings.TrimSpace(cfg.Node.IP)
+	if host == "" || netaddr.IsUnspecified(host) {
+		host = strings.TrimSpace(cfg.UDP.Listen)
 	}
-	if ip == "" || ip == "0.0.0.0" {
-		ip = "127.0.0.1"
+	ip := "127.0.0.1"
+	if host != "" && !netaddr.IsUnspecified(host) {
+		resolved, err := netaddr.ResolveIP(context.Background(), host)
+		if err != nil {
+			return fmt.Errorf("http2gw advertise: %w", err)
+		}
+		ip = resolved.String()
 	}
 	port := uint32(cfg.UDP.Port)
 	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr != nil && addr.Port > 0 {

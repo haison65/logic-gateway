@@ -23,6 +23,17 @@ func TestLoadHTTP2GW(t *testing.T) {
 	}
 }
 
+func TestLoadHTTP2GWDevYAMLUnchanged(t *testing.T) {
+	t.Parallel()
+	cfg, err := LoadHTTP2GW(filepath.Join("..", "..", "configs", "http2gw.dev.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTP.Listen != "127.0.0.1" || cfg.UDP.Listen != "127.0.0.1" || cfg.HTTP.Port != 8080 {
+		t.Fatalf("dev yaml changed: %+v", cfg)
+	}
+}
+
 func TestLoadLogic(t *testing.T) {
 	t.Parallel()
 	cfg, err := LoadLogic(filepath.Join("..", "..", "configs", "logic.yaml"))
@@ -32,11 +43,64 @@ func TestLoadLogic(t *testing.T) {
 	if cfg.Node.NodeID != 2 || cfg.UDP.Port != 9100 || cfg.Gateway.Port != 9000 {
 		t.Fatalf("cfg = %+v", cfg)
 	}
-	if cfg.AdvertiseIP() != "127.0.0.1" {
+	if cfg.AdvertiseIP() != "127.0.0.1" || cfg.AdvertiseHost() != "127.0.0.1" {
 		t.Fatalf("advertise = %s", cfg.AdvertiseIP())
 	}
 	if len(cfg.Services) != 1 || cfg.Services[0].ServiceID != 100 {
 		t.Fatalf("services = %+v", cfg.Services)
+	}
+}
+
+func TestLoadLogicDevYAMLUnchanged(t *testing.T) {
+	t.Parallel()
+	cfg, err := LoadLogic(filepath.Join("..", "..", "configs", "logic.dev.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UDP.Listen != "127.0.0.1" || cfg.Gateway.Host != "127.0.0.1" || cfg.Node.IP != "127.0.0.1" {
+		t.Fatalf("dev yaml changed: %+v", cfg)
+	}
+}
+
+func TestLogicGatewayHostAllowsHostname(t *testing.T) {
+	t.Parallel()
+	cfg := validLogic()
+	cfg.Gateway.Host = "http2gw"
+	cfg.Node.IP = "logic"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdvertiseHost() != "logic" {
+		t.Fatalf("advertise = %s", cfg.AdvertiseHost())
+	}
+}
+
+func TestLogicGatewayHostRejectsUnspecifiedAndJunk(t *testing.T) {
+	t.Parallel()
+	cfg := validLogic()
+	cfg.Gateway.Host = "0.0.0.0"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unspecified gateway.host error")
+	}
+	cfg = validLogic()
+	cfg.Gateway.Host = "http2gw:9000"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected host:port error")
+	}
+	cfg = validLogic()
+	cfg.Node.IP = "0.0.0.0"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unspecified node.ip error")
+	}
+}
+
+func validLogic() Logic {
+	return Logic{
+		Node:      Node{NodeID: 2, InstanceID: "logic-1", IP: "127.0.0.1"},
+		UDP:       UDP{Listen: "127.0.0.1", Port: 9100},
+		Gateway:   Gateway{Host: "127.0.0.1", Port: 9000},
+		Heartbeat: Heartbeat{Interval: Duration(time.Second)},
+		Services:  []Service{{ServiceID: 100, ServiceName: "call", MessageTypes: []uint32{1001}}},
 	}
 }
 
