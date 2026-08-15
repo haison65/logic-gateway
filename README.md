@@ -96,7 +96,10 @@ Hoặc `make proto` (cần `protoc` trên `PATH`).
 cmd/http2gw/          gateway: HTTP/2 + UDP
 cmd/logic/            Logic: REGISTER, HEARTBEAT, echo DATA
 cmd/client/           client HTTP/2 (h2c) + đẩy tải
-configs/              YAML (*.dev.yaml cho local)
+configs/              *.dev.yaml (host); *.docker.yaml (image)
+Dockerfile            image http2gw + logic
+docker-compose.yml    mạng DNS http2gw / logic
+document/
 internal/gateway/     wire http2gw
 internal/httpsrv/     POST /v1/data, health, metrics
 internal/dispatch/    consumer UDP Receive duy nhất
@@ -126,14 +129,108 @@ document/
 
 Ctrl+C: client → logic → http2gw. Cổng bị chiếm trên Windows: `netstat -ano | findstr "8080 9000 9100"` rồi `Stop-Process -Id <PID> -Force`.
 
-## Docker Compose (HTTP2GW + Logic)
+## Docker
 
-Chi tiết: [document/docker.md](document/docker.md). Tóm tắt:
+Không phải production-ready. Client **không** vào image: vẫn `go run ./cmd/client` trên host. Troubleshooting đầy đủ: [document/docker.md](document/docker.md).
+
+### Topology
+
+```text
+Host  --TCP 8080-->  http2gw (container)
+                       UDP :9000  (chỉ mạng Compose, DNS tên http2gw)
+                         │
+                         ▼
+                       logic (container, UDP :9100, DNS tên logic)
+```
+
+Hai service trong `docker-compose.yml`, mạng `logic-gateway-app`. Logic `gateway.host: http2gw`, `node.ip: logic` (`configs/*.docker.yaml`). **Không** dùng `127.0.0.1` giữa hai container, **không** mount `*.dev.yaml`.
+
+| File | Việc |
+|------|------|
+| `Dockerfile` | Multi-stage: `golang:1.26` → distroless **nonroot**; target `http2gw` / `logic` |
+| `docker-compose.yml` | DNS, publish 8080, `-debug=false`, SIGTERM 10s |
+| `configs/http2gw.docker.yaml` | Listen `0.0.0.0:8080` / UDP `9000` |
+| `configs/logic.docker.yaml` | Listen `0.0.0.0:9100`, GW `http2gw:9000` |
+
+### Cổng
+
+| Cổng | Vai trò | Ra host? |
+|------|---------|----------|
+| TCP **8080** | HTTP/2 client | Có (`8080:8080`) |
+| UDP **9000** | REGISTER / HEARTBEAT / DATA | Không |
+| UDP **9100** | Logic nhận DATA | Không |
+
+8080 trên máy phải trống. Tắt `go run` local hoặc container lẻ trước khi Compose.
+
+### Chạy E2E
 
 ```powershell
+docker compose config
 docker compose up --build -d
+docker compose logs -f
+```
+
+Đợi log Logic `logic đã đăng ký` rồi ~1s (HEARTBEAT → ACTIVE). Terminal khác:
+
+```powershell
 go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -session-id sess-1 -body hello
+```
+
+Kỳ vọng: `proto: HTTP/2`, `status: 200`, `body: hello`.
+
+Health GW từ host (image không có curl):
+
+```powershell
+curl.exe -s http://127.0.0.1:8080/healthz
+```
+
+Logic không có HTTP health — xem log REGISTER hoặc `docker compose ps`.
+
+```powershell
+docker compose logs http2gw
+docker compose logs logic
+docker compose stop
 docker compose down
 ```
 
-Publish host chỉ **8080/tcp**. UDP 9000/9100 nội bộ. Localhost không Docker: `*.dev.yaml` + `go run`.
+`stop` = SIGTERM: đóng HTTP + UDP. Registry RAM **mất** khi restart; Logic REGISTER lại (có retry).
+
+Chỉ `docker run` một image, không mạng chung → client thường **503** (không có Logic ACTIVE).
+
+Build image lẻ (không E2E):
+
+```powershell
+docker build --target http2gw -t logic-gateway/http2gw:local .
+docker build --target logic -t logic-gateway/logic:local .
+```
+
+### Tải trên Compose
+
+Nhẹ:
+
+```powershell
+go run ./cmd/client -n 200 -c 10
+go run ./cmd/client -n 1000 -c 20 -qps 100
+```
+
+Nặng (`-n 5000 -c 50`) dễ làm Logic **SUSPECT/DEAD** (HB 3s/6s, một node) → **503**. DEAD không hồi bằng heartbeat:
+
+```powershell
+docker compose restart logic
+```
+
+Rồi đợi `logic đã đăng ký`. Compose mặc định `-debug=false` để log không chèn HB.
+
+### Lỗi thường gặp
+
+| Hiện tượng | Việc làm |
+|------------|----------|
+| `connection refused` | Compose chưa up; 8080 bị chiếm |
+| `bind` / port in use | `netstat -ano \| findstr ":8080"` |
+| `resolve host "http2gw"` | Phải Compose, không run lẻ |
+| Spam `gửi lại REGISTER` | GW chưa listen UDP |
+| HTTP **503** | Chưa ACTIVE, hoặc DEAD sau tải → `restart logic` |
+| `dead node cannot heartbeat` | Restart Logic |
+| HTTP **504** | UDP không echo / sai advertise IP |
+
+Localhost không Docker: vẫn mục **Nhanh (local)** + `configs/*.dev.yaml`.
