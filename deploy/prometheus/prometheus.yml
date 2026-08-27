@@ -1,0 +1,23 @@
+# Scrape http2gw Prometheus exposition (/metrics).
+# Dùng với docker-compose (target DNS: http2gw) hoặc scrape host khi chạy go run.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Gateway trong cùng mạng Compose
+  - job_name: http2gw
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["http2gw:8080"]
+        labels:
+          env: compose
+
+  # Gateway chạy trên host (go run). Windows/Mac Docker Desktop + Linux với host-gateway.
+  - job_name: http2gw-host
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          env: host

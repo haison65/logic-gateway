@@ -106,6 +106,13 @@ func (d *Dispatcher) handle(ctx context.Context, env *pb.Envelope, from *net.UDP
 		d.onRegister(ctx, env, from)
 	case pb.MessageType_MESSAGE_TYPE_HEARTBEAT_REQUEST:
 		d.onHeartbeat(ctx, env, from)
+	case pb.MessageType_MESSAGE_TYPE_HEARTBEAT_RESPONSE:
+		// Phản hồi cho HEARTBEAT HTTP2GW → Logic; không ApplyHeartbeat (Logic đã sống qua chiều ngược).
+		d.log.Debug("udp heartbeat response",
+			zap.Uint64("transaction_id", env.GetTransactionId()),
+			zap.String("from", addrString(from)),
+			zap.Uint64("sequence", heartbeatResponseSequence(env)),
+		)
 	case pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE:
 		d.log.Debug("udp data response",
 			zap.Uint64("transaction_id", env.GetTransactionId()),
@@ -218,6 +225,13 @@ func dataResponseStatus(env *pb.Envelope) uint32 {
 		return 0
 	}
 	return env.GetDataResponse().GetStatus()
+}
+
+func heartbeatResponseSequence(env *pb.Envelope) uint64 {
+	if env == nil || env.GetHeartbeatResponse() == nil {
+		return 0
+	}
+	return env.GetHeartbeatResponse().GetSequence()
 }
 
 // Đảm bảo *outbound.Client thỏa Outbound.
