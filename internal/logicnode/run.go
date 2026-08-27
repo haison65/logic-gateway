@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/haison65/logic-gateway/internal/config"
+	"github.com/haison65/logic-gateway/internal/controlplane"
 	"github.com/haison65/logic-gateway/internal/logger"
 	"github.com/haison65/logic-gateway/internal/netaddr"
 	"github.com/haison65/logic-gateway/internal/protocol"
@@ -103,6 +105,18 @@ func Run(ctx context.Context, cfg config.Logic, log *zap.Logger) error {
 
 	var seq atomic.Uint64
 	go heartbeatLoop(runCtx, conn, cfg, gwAddr, &seq, log, rt)
+
+	if strings.TrimSpace(cfg.MasterURL) != "" {
+		go func() {
+			agent := &controlplane.Agent{
+				MasterURL: cfg.MasterURL,
+				Body:      controlplane.BodyFromLogic(cfg, advertisePort),
+				Interval:  cfg.Heartbeat.Interval.Duration(),
+				Log:       log.Named("controlplane"),
+			}
+			_ = agent.Run(runCtx)
+		}()
+	}
 
 	select {
 	case <-runCtx.Done():
@@ -251,6 +265,28 @@ func handleIncoming(ctx context.Context, tr udp.Transport, nodeID uint32, gw *ne
 		select {
 		case regCh <- env.GetRegisterResponse():
 		default:
+		}
+	case pb.MessageType_MESSAGE_TYPE_HEARTBEAT_REQUEST:
+		// HTTP2GW → Logic heartbeat: trả HEARTBEAT_RESPONSE.
+		dest := from
+		if dest == nil {
+			dest = gw
+		}
+		var seq uint64
+		if req := env.GetHeartbeatRequest(); req != nil {
+			seq = req.GetSequence()
+		}
+		ts := time.Now().UnixMilli()
+		if ts < 0 {
+			ts = 0
+		}
+		out := protocol.Reply(nodeID, env, pb.MessageType_MESSAGE_TYPE_HEARTBEAT_RESPONSE)
+		out.Body = &pb.Envelope_HeartbeatResponse{HeartbeatResponse: &pb.HeartbeatResponse{
+			Sequence:    seq,
+			TimestampMs: uint64(ts),
+		}}
+		if err := tr.Send(ctx, out, dest); err != nil {
+			log.Warn("gửi HEARTBEAT_RESPONSE thất bại", zap.Error(err), zap.String("to", addrString(dest)))
 		}
 	case pb.MessageType_MESSAGE_TYPE_HEARTBEAT_RESPONSE:
 		if rt != nil {

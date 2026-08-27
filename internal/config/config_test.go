@@ -21,6 +21,12 @@ func TestLoadHTTP2GW(t *testing.T) {
 	if cfg.StrategyName() != "consistent_hash" {
 		t.Fatalf("strategy = %s", cfg.StrategyName())
 	}
+	if len(cfg.Services) != 1 || cfg.Services[0].ServiceID != 1 || cfg.Services[0].ServiceName != "http2gw" {
+		t.Fatalf("services = %+v", cfg.Services)
+	}
+	if got := cfg.Services[0].MessageTypes; len(got) != 3 || got[0] != 1001 || got[1] != 1002 || got[2] != 1003 {
+		t.Fatalf("message_types = %v", got)
+	}
 }
 
 func TestLoadHTTP2GWDevYAMLUnchanged(t *testing.T) {
@@ -134,5 +140,21 @@ func TestValidateRejectsBadStrategy(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestHTTP2GWValidateRejectsZeroServiceID(t *testing.T) {
+	t.Parallel()
+	cfg := HTTP2GW{
+		Node:        Node{NodeID: 1, InstanceID: "gw"},
+		HTTP:        HTTP{Listen: "127.0.0.1", Port: 8080},
+		UDP:         UDP{Listen: "127.0.0.1", Port: 9000},
+		Heartbeat:   Heartbeat{Interval: Duration(time.Second), Timeout: Duration(3 * time.Second), DeadTimeout: Duration(6 * time.Second)},
+		Transaction: Transaction{Timeout: Duration(5 * time.Second)},
+		Routing:     Routing{Strategy: "consistent_hash"},
+		Services:    []Service{{ServiceID: 0, ServiceName: "bad"}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected services[0].service_id error")
 	}
 }

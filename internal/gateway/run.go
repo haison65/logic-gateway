@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/haison65/logic-gateway/internal/config"
+	"github.com/haison65/logic-gateway/internal/controlplane"
 	"github.com/haison65/logic-gateway/internal/dispatch"
 	"github.com/haison65/logic-gateway/internal/heartbeat"
 	"github.com/haison65/logic-gateway/internal/httpsrv"
@@ -64,6 +65,18 @@ func Run(ctx context.Context, cfg config.HTTP2GW, log *zap.Logger) error {
 	}
 	mon.OnTimeout = func(n int) { met.AddHeartbeatTimeout(int64(n)) }
 
+	hbSender, err := heartbeat.NewSender(
+		cfg.Node.NodeID,
+		regStore,
+		conn,
+		cfg.Heartbeat.Interval.Duration(),
+		nil,
+		log.Named("heartbeat.outbound"),
+	)
+	if err != nil {
+		return err
+	}
+
 	rt := router.New(regStore, newStrategy(cfg.StrategyName()))
 	txMgr := transaction.NewManager()
 	txSvc, err := transaction.NewService(txMgr, rt, conn, transaction.Config{
@@ -94,7 +107,29 @@ func Run(ctx context.Context, cfg config.HTTP2GW, log *zap.Logger) error {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 6)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				by := map[string]int{}
+				for _, n := range regStore.List() {
+					if n == nil || n.Type != registry.TypeLogic {
+						continue
+					}
+					by[n.State.String()]++
+				}
+				met.ObserveLogicRegistry(by)
+			}
+		}
+	}()
 
 	wg.Add(1)
 	go func() {
@@ -102,6 +137,16 @@ func Run(ctx context.Context, cfg config.HTTP2GW, log *zap.Logger) error {
 		err := mon.Run(runCtx)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- fmt.Errorf("heartbeat monitor: %w", err)
+			cancel()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := hbSender.Run(runCtx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- fmt.Errorf("heartbeat sender: %w", err)
 			cancel()
 		}
 	}()
@@ -125,6 +170,23 @@ func Run(ctx context.Context, cfg config.HTTP2GW, log *zap.Logger) error {
 			cancel()
 		}
 	}()
+
+	if strings.TrimSpace(cfg.MasterURL) != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			agent := &controlplane.Agent{
+				MasterURL: cfg.MasterURL,
+				Body:      controlplane.BodyFromHTTP2GW(cfg),
+				Interval:  cfg.Heartbeat.Interval.Duration(),
+				Log:       log.Named("controlplane"),
+			}
+			if agent.Body.Address == "" || netaddr.IsUnspecified(agent.Body.Address) {
+				agent.Body.Address = "127.0.0.1"
+			}
+			_ = agent.Run(runCtx)
+		}()
+	}
 
 	var runErr error
 	select {
@@ -151,9 +213,10 @@ func newStrategy(name string) router.Strategy {
 	return router.NewConsistentHash(0)
 }
 
-// registerSelf đưa HTTP2GW vào Registry local.
-// §6 yêu cầu "gửi REGISTER" khi start nhưng không nêu đích UDP (Logic gửi tới gateway).
-// Không invent peer/mesh: đăng ký semantic NODE_TYPE_HTTP2GW vào cùng Registry.
+// registerSelf đưa HTTP2GW vào Registry local khi start (§6).
+// Design yêu cầu gửi REGISTER + identity + capability + message_types.
+// Không nêu đích UDP peer (Logic mới gửi REGISTER tới gateway) → đăng ký semantic
+// NODE_TYPE_HTTP2GW vào cùng Registry, kèm Services từ YAML (không invent mesh).
 func registerSelf(reg *registration.Service, cfg config.HTTP2GW, conn udp.Transport) error {
 	host := strings.TrimSpace(cfg.Node.IP)
 	if host == "" || netaddr.IsUnspecified(host) {
@@ -171,12 +234,21 @@ func registerSelf(reg *registration.Service, cfg config.HTTP2GW, conn udp.Transp
 	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr != nil && addr.Port > 0 {
 		port = uint32(addr.Port)
 	}
+	services := make([]*pb.ServiceCapability, 0, len(cfg.Services))
+	for _, svc := range cfg.Services {
+		services = append(services, &pb.ServiceCapability{
+			ServiceId:    svc.ServiceID,
+			ServiceName:  svc.ServiceName,
+			MessageTypes: append([]uint32(nil), svc.MessageTypes...),
+		})
+	}
 	resp, err := reg.Register(&pb.RegisterRequest{
 		NodeId:     cfg.Node.NodeID,
 		NodeType:   pb.NodeType_NODE_TYPE_HTTP2GW,
 		InstanceId: cfg.Node.InstanceID,
 		Ip:         ip,
 		Port:       port,
+		Services:   services,
 	})
 	if err != nil {
 		return err

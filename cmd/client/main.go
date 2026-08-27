@@ -9,9 +9,15 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/haison65/logic-gateway/internal/config"
+	"github.com/haison65/logic-gateway/internal/controlplane"
+	"go.uber.org/zap"
 )
 
 func main() {
+	configPath := flag.String("config", "", "YAML LoadClient (http2_client / performance); nếu set thì ưu tiên hơn flag load")
+	masterURL := flag.String("master-url", "", "override master_url (control-plane)")
 	var opt options
 	flag.StringVar(&opt.addr, "addr", "http://127.0.0.1:8080", "địa chỉ http2gw")
 	flag.UintVar(&opt.messageID, "message-id", 1001, "X-Message-Id")
@@ -26,6 +32,55 @@ func main() {
 	flag.Float64Var(&opt.qps, "qps", 0, "giới hạn request/giây (0 = không giới hạn)")
 	flag.BoolVar(&opt.verbose, "v", false, "in từng request lỗi khi đẩy tải")
 	flag.Parse()
+
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+	var loadCfg *config.LoadClient
+	if strings.TrimSpace(*configPath) != "" {
+		cfg, err := config.LoadLoadClient(*configPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config:", err)
+			os.Exit(2)
+		}
+		loadCfg = &cfg
+		if !setFlags["addr"] {
+			opt.addr = cfg.Target
+		}
+		if !setFlags["message-id"] {
+			opt.messageID = uint(cfg.MessageID)
+		}
+		if !setFlags["session-id"] {
+			opt.sessionID = cfg.SessionID
+		}
+		if !setFlags["unique-session"] {
+			opt.uniqueSession = cfg.UniqueSession
+		}
+		if !setFlags["body"] {
+			opt.body = cfg.Body
+		}
+		if !setFlags["timeout"] {
+			opt.timeout = cfg.Timeout.Duration()
+		}
+		if !setFlags["c"] {
+			opt.c = cfg.Concurrency
+		}
+		if !setFlags["qps"] {
+			opt.qps = cfg.QPS
+		}
+		if !setFlags["d"] {
+			opt.duration = cfg.Duration.Duration()
+		}
+		if !setFlags["n"] {
+			opt.n = cfg.N
+		}
+		if *masterURL == "" {
+			*masterURL = cfg.MasterURL
+		}
+	}
+	if *masterURL == "" && loadCfg != nil {
+		*masterURL = loadCfg.MasterURL
+	}
 
 	if opt.messageID == 0 {
 		fmt.Fprintln(os.Stderr, "message-id must be > 0")
@@ -51,6 +106,20 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if loadCfg != nil && strings.TrimSpace(*masterURL) != "" {
+		agentCtx, agentCancel := context.WithCancel(ctx)
+		defer agentCancel()
+		go func() {
+			body := controlplane.BodyFromLoadClient(*loadCfg)
+			_ = (&controlplane.Agent{
+				MasterURL: *masterURL,
+				Body:      body,
+				Interval:  time.Second,
+				Log:       zap.NewNop(),
+			}).Run(agentCtx)
+		}()
+	}
 
 	client := newH2CClient(opt.timeout)
 	single := opt.n == 1 && opt.c == 1 && opt.duration == 0

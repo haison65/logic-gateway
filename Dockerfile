@@ -6,7 +6,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/http2gw ./cmd/http2gw \
- && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/logic ./cmd/logic
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/logic ./cmd/logic \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/master ./cmd/master
 
 FROM gcr.io/distroless/static-debian12:nonroot AS http2gw
 WORKDIR /
@@ -24,5 +25,15 @@ COPY --from=build --chown=nonroot:nonroot /out/logic /logic
 COPY --chown=nonroot:nonroot configs/logic.docker.yaml /configs/logic.yaml
 USER nonroot:nonroot
 EXPOSE 9100/udp
+EXPOSE 9101/udp
 ENTRYPOINT ["/logic"]
 CMD ["-config", "/configs/logic.yaml"]
+
+FROM gcr.io/distroless/static-debian12:nonroot AS master
+WORKDIR /
+COPY --from=build --chown=nonroot:nonroot /out/master /master
+COPY --chown=nonroot:nonroot configs/local/master.docker.yaml /configs/master.yaml
+USER nonroot:nonroot
+EXPOSE 9200/tcp
+ENTRYPOINT ["/master"]
+CMD ["-config", "/configs/master.yaml"]

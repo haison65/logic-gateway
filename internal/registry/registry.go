@@ -113,7 +113,15 @@ func (m *Memory) ApplyHeartbeat(nodeID uint32, at time.Time, transition func(Nod
 }
 
 // ApplyTimeouts chuyển trạng thái timeout một cách nguyên tử cho mọi node.
+// Bỏ qua TypeHTTP2GW (DATA-plane registry trên gateway không timeout chính nó).
 func (m *Memory) ApplyTimeouts(now time.Time, transition func(state NodeState, lastHeartbeat time.Time, now time.Time) (NodeState, bool)) []*Node {
+	return m.ApplyTimeoutsExcept(now, func(n *Node) bool {
+		return n != nil && n.Type == TypeHTTP2GW
+	}, transition)
+}
+
+// ApplyTimeoutsExcept như ApplyTimeouts nhưng skip theo predicate (vd Master bỏ qua chính nó).
+func (m *Memory) ApplyTimeoutsExcept(now time.Time, skip func(*Node) bool, transition func(state NodeState, lastHeartbeat time.Time, now time.Time) (NodeState, bool)) []*Node {
 	if transition == nil {
 		return nil
 	}
@@ -122,7 +130,7 @@ func (m *Memory) ApplyTimeouts(now time.Time, transition func(state NodeState, l
 	defer m.mu.Unlock()
 	changed := make([]*Node, 0)
 	for _, n := range m.nodes {
-		if n.Type == TypeHTTP2GW {
+		if skip != nil && skip(n) {
 			continue
 		}
 		next, ok := transition(n.State, n.LastHeartbeatAt, now)

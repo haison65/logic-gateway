@@ -20,7 +20,9 @@ enum MessageType {
   MESSAGE_TYPE_ERROR = 100;
 }
 
-// NodeType phân loại vai trò của node (HTTP2GW hoặc Logic).
+// NodeType phân loại vai trò của node (HTTP2GW hoặc Logic) trên DATA-plane UDP.
+// Control-plane (Master / HTTP2_CLIENT / PERFORMANCE) dùng registry.Type domain
+// (3/4/5) — sẽ map vào proto khi regen có protoc (xem document/audit_local_deployment_phase1.md).
 enum NodeType {
   NODE_TYPE_UNKNOWN = 0;
   NODE_TYPE_HTTP2GW = 1;
