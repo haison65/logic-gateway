@@ -1,42 +1,39 @@
 # Docker (local deployment)
 
-Không phải production-ready. E2E local Compose: hai container trên mạng nội bộ, client HTTP/2 chạy **trên host**.
+Không phải production-ready. Client HTTP/2 (`cmd/client`) chạy **trên host**.  
+SoT hành vi: [`HTTP2GW_Logic_UDP_Protobuf_Design.md`](HTTP2GW_Logic_UDP_Protobuf_Design.md).  
+Quick start không Docker: [`guide_setup.md`](guide_setup.md). Topology scripts: [`local_deployment.md`](local_deployment.md).  
+Resource (GOMAXPROCS ≠ cgroup): [`resource_model.md`](resource_model.md).
 
-SoT hành vi: `HTTP2GW_Logic_UDP_Protobuf_Design.md`. Localhost không Docker: `guide_setup.md`.
+---
 
-------------------------------------------------------------------------
+## Hai file Compose
 
-## Local (`*.dev.yaml`) — không dùng Compose
+| File | Topology | Resource limit |
+|------|----------|----------------|
+| `docker-compose.yml` | http2gw + **1** logic + prometheus | Không |
+| `docker-compose.local.yml` | **master** + http2gw + **logic-1** + **logic-2** + prometheus | Có (`cpus` / `mem_limit`) |
 
-Bind `127.0.0.1`. Thứ tự: http2gw → logic → client.
+Image: `Dockerfile` targets `http2gw` / `logic` / `master` (distroless nonroot).
 
-```powershell
-go run ./cmd/http2gw -config configs/http2gw.dev.yaml
-go run ./cmd/logic -config configs/logic.dev.yaml
-go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -session-id sess-1 -body hello
-```
+---
 
-------------------------------------------------------------------------
+## A. Compose tối thiểu (`docker-compose.yml`)
 
-## Docker Compose
-
-File: `docker-compose.yml`. Image: `Dockerfile` (target `http2gw` / `logic`). Config trong image: `configs/http2gw.docker.yaml`, `configs/logic.docker.yaml` (listen `0.0.0.0`; `gateway.host: http2gw`; `node.ip: logic`).
-
-**Không** mount `*.dev.yaml` vào container.
-
-Mạng: `logic-gateway-app`. DNS: `http2gw`, `logic`.
+- Config bake sẵn: `configs/http2gw.docker.yaml`, `configs/logic.docker.yaml`
+- Mạng: `logic-gateway-app` — DNS `http2gw`, `logic`
+- Listen `0.0.0.0`; `gateway.host=http2gw`; `node.ip=logic`
 
 ### Ports
 
-| Cổng | Ở đâu | Publish ra host |
-|------|--------|-----------------|
-| TCP 8080 | http2gw HTTP/2 | **Có** `8080:8080` |
-| UDP 9000 | http2gw (REGISTER / HB / DATA) | **Không** — chỉ mạng Compose |
-| UDP 9100 | logic DATA | **Không** |
+| Cổng | Service | Publish host |
+|------|---------|--------------|
+| TCP 8080 | http2gw HTTP/2 + `/metrics` | Có |
+| TCP 9090 | Prometheus UI | Có |
+| UDP 9000 | http2gw | Không (chỉ mạng Compose) |
+| UDP 9100 | logic | Không |
 
-8080 trên máy phải trống (`go run` local hoặc container lẻ).
-
-### Start / stop
+### Lệnh
 
 ```powershell
 docker compose config
@@ -46,58 +43,103 @@ docker compose stop
 docker compose down
 ```
 
-`stop` gửi SIGTERM: gateway `Shutdown` HTTP + đóng UDP (~5s). Registry in-memory **mất** khi restart — đúng hành vi hiện tại.
+Mặc định `-debug=false`. Registry in-memory **mất** khi restart GW — Logic phải REGISTER lại (retry sẵn).
 
-Compose mặc định `-debug=false` (tránh log từng DATA làm trễ HEARTBEAT khi đẩy tải). Bật lại: sửa `command` trong compose.
-
-### Test HTTP/2 (host)
+### Test từ host
 
 Đợi log Logic `logic đã đăng ký`, ~1s (ACTIVE):
 
 ```powershell
 go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -session-id sess-1 -body hello
-```
-
-Kỳ vọng: `proto: HTTP/2`, `status: 200`, `body: hello`.
-
-Health GW từ **host** (không có curl trong distroless):
-
-```powershell
 curl.exe -s http://127.0.0.1:8080/healthz
+curl.exe -s http://127.0.0.1:8080/metrics | findstr http2gw_
 ```
 
-Logic **không** có HTTP health — không thêm server chỉ để Docker healthcheck. Xác nhận: log `logic đã đăng ký` / `container Up`.
+Prometheus: http://127.0.0.1:9090 — target `http2gw` (compose) và/hoặc `http2gw-host` (khi scrape host). Chi tiết: [`huong_dan_prometheus_report.md`](huong_dan_prometheus_report.md).
 
-### Logs
+### Logs / tải
 
 ```powershell
 docker compose logs http2gw
 docker compose logs logic
 docker compose logs -f --tail 100
+
+go run ./cmd/client -n 200 -c 10 -unique-session
 ```
 
-### Tải
+Tải nặng + 1 Logic + HB timeout ngắn dễ **SUSPECT/DEAD** → 503. DEAD không hồi bằng HB: `docker compose restart logic`, đợi REGISTER.
 
-Nhẹ: `go run ./cmd/client -n 200 -c 10`.  
-Nặng (`-n 5000 -c 50`) với HB timeout 3s/6s + một Logic: dễ **SUSPECT/DEAD** → HTTP 503. DEAD không hồi bằng heartbeat; `docker compose restart logic` rồi đợi REGISTER lại.
+---
 
-------------------------------------------------------------------------
+## B. Compose đầy đủ + limits (`docker-compose.local.yml`)
+
+Topology:
+
+```text
+master    :9200   (1 CPU, 512M)
+http2gw   :8080   (4 CPU, 8G)   + UDP 9000 nội bộ
+logic-1           (6 CPU, 8G)   UDP 9100, hostname logic-1
+logic-2           (6 CPU, 8G)   UDP 9101, hostname logic-2
+prometheus :9090
+```
+
+Config mount từ `configs/local/*.docker.yaml` (có `master_url: http://master:9200`).
+
+```powershell
+docker compose -f docker-compose.local.yml up -d --build
+docker stats --no-stream
+curl.exe -s http://127.0.0.1:9200/v1/nodes
+curl.exe -s http://127.0.0.1:8080/healthz
+
+go run ./cmd/client -config configs/local/perf-1.dev.yaml
+.\scripts\load_local.ps1
+```
+
+**Yêu cầu Docker Desktop:** RAM VM khuyến nghị ≥ 24G nếu giữ `mem_limit` 8G×3; CPU time-slice nếu host < 17 core. Giảm `mem_limit`/`cpus` trong YAML nếu VM nhỏ hơn.
+
+`GOMAXPROCS` trong compose = gợi ý scheduler Go — **không** thay cgroup limit. Xem [`resource_model.md`](resource_model.md).
+
+Client / Performance **không** chạy trong Compose (tránh vượt RAM) — chạy trên host.
+
+Dừng:
+
+```powershell
+docker compose -f docker-compose.local.yml down
+# xóa volume Prometheus:
+docker compose -f docker-compose.local.yml down -v
+```
+
+---
+
+## Local không Docker (nhắc nhanh)
+
+```powershell
+.\scripts\start_local.ps1
+# hoặc tối thiểu:
+go run ./cmd/http2gw -config configs/http2gw.dev.yaml
+go run ./cmd/logic -config configs/logic.dev.yaml
+go run ./cmd/client -n 1 -body hello
+```
+
+---
 
 ## Troubleshooting
 
 | Hiện tượng | Hướng xử lý |
 |------------|-------------|
-| DNS không resolve / Logic `resolve host "http2gw"` | Phải `docker compose up`, không `docker run` lẻ. Tên service đúng `http2gw` / `logic`. |
-| REGISTER fail / spam `gửi lại REGISTER` | GW chưa listen UDP 9000; sai `gateway.host`; hai stack khác mạng. |
-| Logic không ACTIVE / HTTP 503 | Chưa HB (~1s); node DEAD sau tải — `restart logic`; Router chỉ chọn ACTIVE. |
-| UDP không tới / 504 | Advertise `127.0.0.1` hoặc `0.0.0.0` (docker yaml không được vậy); firewall; Logic không echo. |
-| Port conflict `8080` | `netstat -ano \| findstr ":8080"`; tắt `go run` / container cũ. |
-| Container restart | Registry trống; Logic phải REGISTER lại (retry sẵn). |
-| Client `connection refused` | Compose chưa up; sai `-addr`; bind chưa `0.0.0.0` trong docker yaml. |
-| `dead node cannot heartbeat` | Monitor đã DEAD; HB bị từ chối; restart Logic. |
+| DNS / `resolve host "http2gw"` | Phải `docker compose up`, không `docker run` lẻ; đúng tên service |
+| Spam `gửi lại REGISTER` | GW chưa listen UDP 9000; sai `gateway.host`; khác mạng |
+| HTTP 503 | Logic chưa ACTIVE / DEAD — `restart` logic tương ứng; Router chỉ ACTIVE |
+| HTTP 504 | Advertise IP sai; Logic không echo; firewall |
+| Port 8080/9200 conflict | Tắt `go run` / compose cũ: `netstat -ano \| findstr ":8080"` |
+| Master `/v1/nodes` thiếu Logic | Dùng `docker-compose.local.yml` + yaml có `master_url`; đợi agent register |
+| `docker stats` limit không đúng | Compose file cũ không có `mem_limit`; hoặc Docker Desktop RAM thấp |
+| `dead node cannot heartbeat` | Restart Logic → REGISTER lại |
+| Client `connection refused` | Compose chưa ready; bind chưa `0.0.0.0` trong docker yaml |
 
-------------------------------------------------------------------------
+---
 
 ## Image (tham khảo)
 
-Multi-stage `golang:1.26` → `distroless/static-debian12:nonroot`. Không root. Không health binary trong image.
+Multi-stage `golang:1.26` → `gcr.io/distroless/static-debian12:nonroot`.  
+Targets: `http2gw`, `logic`, `master`. Không root. Không shell/curl trong image — health từ **host**.
