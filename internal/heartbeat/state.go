@@ -23,7 +23,7 @@ func NextOnHeartbeat(from registry.NodeState) (registry.NodeState, error) {
 // NextOnTimeout trả về trạng thái sau khi so sánh elapsed với ngưỡng.
 // changed = false nếu không cần đổi state.
 func NextOnTimeout(from registry.NodeState, elapsed, suspectAfter, deadAfter time.Duration) (registry.NodeState, bool) {
-	if from == registry.NodeStateDead || from == registry.NodeStateUnspecified {
+	if from == registry.NodeStateDead || from == registry.NodeStateUnspecified || from == registry.NodeStateStopping {
 		return from, false
 	}
 	if elapsed >= deadAfter {
