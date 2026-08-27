@@ -1,0 +1,21 @@
+# Master — control-plane (Phase 3+ binary). ID scheme: 1=master.
+node:
+  node_id: 1
+  instance_id: master-1
+  name: master
+  type: master
+  group: local-server
+  ip: 127.0.0.1
+
+http:
+  listen: 127.0.0.1
+  port: 9200
+
+heartbeat:
+  interval: 1000ms
+  timeout: 3000ms
+  dead_timeout: 6000ms
+
+resource:
+  cpu_cores: 1
+  memory: 512M

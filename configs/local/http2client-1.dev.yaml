@@ -1,0 +1,23 @@
+node:
+  node_id: 20
+  instance_id: http2client-1
+  name: http2client-1
+  type: http2_client
+  group: tool-client
+  ip: 127.0.0.1
+
+target: http://127.0.0.1:8080
+message_id: 1001
+session_id: cli1
+unique_session: true
+body: hello
+timeout: 10s
+concurrency: 4
+qps: 20
+duration: 30s
+n: 0
+master_url: http://127.0.0.1:9200
+
+resource:
+  cpu_cores: 1
+  memory: 512M

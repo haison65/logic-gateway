@@ -1,0 +1,30 @@
+node:
+  node_id: 3
+  instance_id: logic-2-docker
+  name: logic-2
+  type: logic
+  group: local-server
+  ip: logic-2
+
+udp:
+  listen: 0.0.0.0
+  port: 9101
+
+gateway:
+  host: http2gw
+  port: 9000
+
+services:
+  - service_id: 100
+    service_name: call
+    message_types: [1001, 1002, 1003]
+
+heartbeat:
+  interval: 1000ms
+  timeout: 3000ms
+
+resource:
+  cpu_cores: 6
+  memory: 8G
+
+master_url: http://master:9200

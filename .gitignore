@@ -28,3 +28,7 @@ Thumbs.db
 *.local.yaml
 .env
 .env.*
+
+# P0 load client logs
+scripts/load-logs/
+scripts/run/

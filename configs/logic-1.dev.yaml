@@ -1,0 +1,22 @@
+# Logic node 1 — P0 local (go run)
+udp:
+  listen: 127.0.0.1
+  port: 9100
+
+gateway:
+  host: 127.0.0.1
+  port: 9000
+
+node:
+  node_id: 2
+  instance_id: logic-1-dev
+  ip: 127.0.0.1
+
+services:
+  - service_id: 100
+    service_name: call
+    message_types: [1001, 1002, 1003]
+
+heartbeat:
+  interval: 1000ms
+  timeout: 3000ms

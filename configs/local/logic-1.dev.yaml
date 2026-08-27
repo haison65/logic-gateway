@@ -1,0 +1,31 @@
+# Logic-1 — UDP 9100, node_id=2. Resource target: 6 CPU / 8G (limit thật ở Compose Phase 7).
+node:
+  node_id: 2
+  instance_id: logic-1-local
+  name: logic-1
+  type: logic
+  group: local-server
+  ip: 127.0.0.1
+
+udp:
+  listen: 127.0.0.1
+  port: 9100
+
+gateway:
+  host: 127.0.0.1
+  port: 9000
+
+services:
+  - service_id: 100
+    service_name: call
+    message_types: [1001, 1002, 1003]
+
+heartbeat:
+  interval: 1000ms
+  timeout: 3000ms
+
+resource:
+  cpu_cores: 6
+  memory: 8G
+
+master_url: http://127.0.0.1:9200
