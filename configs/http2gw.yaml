@@ -20,3 +20,8 @@ transaction:
 
 routing:
   strategy: consistent_hash
+
+services:
+  - service_id: 1
+    service_name: http2gw
+    message_types: [1001, 1002, 1003]

@@ -24,11 +24,19 @@ type HTTP2GW struct {
 	Heartbeat   Heartbeat   `yaml:"heartbeat"`
 	Transaction Transaction `yaml:"transaction"`
 	Routing     Routing     `yaml:"routing"`
+	// Services: capability + message_types HTTP2GW khai báo khi REGISTER (§6).
+	Services []Service `yaml:"services"`
+	Resource Resource  `yaml:"resource"`
+	// MasterURL: control-plane (Phase 3+); trống = không báo cáo Master.
+	MasterURL string `yaml:"master_url"`
 }
 
 type Node struct {
 	NodeID     uint32 `yaml:"node_id"`
 	InstanceID string `yaml:"instance_id"`
+	Name       string `yaml:"name"`
+	Type       string `yaml:"type"` // http2_server | logic (optional metadata)
+	Group      string `yaml:"group"`
 	IP         string `yaml:"ip"`
 }
 
@@ -100,6 +108,22 @@ func (c *HTTP2GW) applyDefaults() {
 	if strings.TrimSpace(c.Routing.Strategy) == "" {
 		c.Routing.Strategy = "consistent_hash"
 	}
+	if len(c.Services) == 0 {
+		c.Services = []Service{{
+			ServiceID:    1,
+			ServiceName:  "http2gw",
+			MessageTypes: []uint32{1001, 1002, 1003},
+		}}
+	}
+	if strings.TrimSpace(c.Node.Name) == "" {
+		c.Node.Name = c.Node.InstanceID
+	}
+	if strings.TrimSpace(c.Node.Type) == "" {
+		c.Node.Type = "http2_server"
+	}
+	if strings.TrimSpace(c.Node.Group) == "" {
+		c.Node.Group = "local-server"
+	}
 }
 
 // Validate kiểm tra trường bắt buộc.
@@ -144,7 +168,12 @@ func (c HTTP2GW) Validate() error {
 	default:
 		return fmt.Errorf("routing.strategy %q is not supported", c.Routing.Strategy)
 	}
-	return nil
+	for i, svc := range c.Services {
+		if svc.ServiceID == 0 {
+			return fmt.Errorf("services[%d].service_id is required", i)
+		}
+	}
+	return c.Resource.Validate("resource")
 }
 
 // StrategyName chuẩn hóa tên strategy.

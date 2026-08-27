@@ -16,6 +16,8 @@ type Logic struct {
 	Gateway   Gateway   `yaml:"gateway"`
 	Heartbeat Heartbeat `yaml:"heartbeat"`
 	Services  []Service `yaml:"services"`
+	Resource  Resource  `yaml:"resource"`
+	MasterURL string    `yaml:"master_url"`
 }
 
 type Gateway struct {
@@ -66,6 +68,15 @@ func (c *Logic) applyDefaults() {
 			MessageTypes: []uint32{1001, 1002, 1003},
 		}}
 	}
+	if strings.TrimSpace(c.Node.Name) == "" {
+		c.Node.Name = c.Node.InstanceID
+	}
+	if strings.TrimSpace(c.Node.Type) == "" {
+		c.Node.Type = "logic"
+	}
+	if strings.TrimSpace(c.Node.Group) == "" {
+		c.Node.Group = "local-server"
+	}
 }
 
 // Validate kiểm tra cấu hình Logic.
@@ -104,7 +115,7 @@ func (c Logic) Validate() error {
 			return fmt.Errorf("services[%d].service_id is required", i)
 		}
 	}
-	return nil
+	return c.Resource.Validate("resource")
 }
 
 // AdvertiseHost là địa chỉ Logic đưa vào REGISTER (sau khi resolve thành IP literal).
