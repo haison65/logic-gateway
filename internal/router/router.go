@@ -31,6 +31,11 @@ func New(source NodeSource, strategy Strategy) *Router {
 
 // Route trả về bản sao node đích. Không gửi message.
 func (r *Router) Route(ctx context.Context, env *pb.Envelope) (*registry.Node, error) {
+	return r.RouteExcluding(ctx, env)
+}
+
+// RouteExcluding như Route nhưng bỏ qua các node_id (vd failover sau Send/timeout).
+func (r *Router) RouteExcluding(ctx context.Context, env *pb.Envelope, excludeNodeIDs ...uint32) (*registry.Node, error) {
 	if r == nil || r.source == nil || r.strategy == nil {
 		return nil, fmt.Errorf("%w: router is not configured", ErrNoEligibleNode)
 	}
@@ -48,7 +53,24 @@ func (r *Router) Route(ctx context.Context, env *pb.Envelope) (*registry.Node, e
 		return nil, err
 	}
 
+	exclude := make(map[uint32]struct{}, len(excludeNodeIDs))
+	for _, id := range excludeNodeIDs {
+		if id != 0 {
+			exclude[id] = struct{}{}
+		}
+	}
+
 	candidates := eligible(r.source.List(), msgID)
+	if len(exclude) > 0 {
+		filtered := candidates[:0]
+		for _, n := range candidates {
+			if _, skip := exclude[n.ID]; skip {
+				continue
+			}
+			filtered = append(filtered, n)
+		}
+		candidates = filtered
+	}
 	if len(candidates) == 0 {
 		return nil, ErrNoEligibleNode
 	}

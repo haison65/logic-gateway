@@ -362,11 +362,77 @@ func TestRequestSendFailure(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v", err)
 	}
-	if tr.sends.Load() != 1 {
-		t.Fatalf("sends = %d", tr.sends.Load())
+	// Send fail → 1 failover retry → 2 sends (cùng node nếu stub không exclude).
+	if tr.sends.Load() != 2 {
+		t.Fatalf("sends = %d want 2", tr.sends.Load())
 	}
 	if err := m.Complete(12, dataResp(12, 1001)); !errors.Is(err, ErrUnknownTransaction) {
 		t.Fatalf("tx not cleaned: %v", err)
+	}
+}
+
+type stubExcludeRouter struct {
+	nodes []*registry.Node
+	n     atomic.Int32
+}
+
+func (s *stubExcludeRouter) Route(ctx context.Context, env *pb.Envelope) (*registry.Node, error) {
+	return s.RouteExcluding(ctx, env)
+}
+
+func (s *stubExcludeRouter) RouteExcluding(_ context.Context, _ *pb.Envelope, exclude ...uint32) (*registry.Node, error) {
+	s.n.Add(1)
+	ex := map[uint32]struct{}{}
+	for _, id := range exclude {
+		ex[id] = struct{}{}
+	}
+	for _, n := range s.nodes {
+		if _, skip := ex[n.ID]; skip {
+			continue
+		}
+		return n, nil
+	}
+	return nil, errors.New("no eligible")
+}
+
+func TestRequestFailoverAfterSendFail(t *testing.T) {
+	t.Parallel()
+	m := NewManager()
+	n1 := &registry.Node{ID: 2, Type: registry.TypeLogic, Address: "127.0.0.1", UDPPort: 9100}
+	n2 := &registry.Node{ID: 3, Type: registry.TypeLogic, Address: "127.0.0.1", UDPPort: 9101}
+	rt := &stubExcludeRouter{nodes: []*registry.Node{n1, n2}}
+	tr := &stubTransport{}
+	var sendN atomic.Int32
+	tr.onSend = func(env *pb.Envelope) {
+		if sendN.Add(1) == 1 {
+			tr.err = errors.New("udp down")
+		} else {
+			tr.err = nil
+			go func() {
+				time.Sleep(5 * time.Millisecond)
+				_ = m.Complete(env.GetTransactionId(), dataResp(env.GetTransactionId(), 1001))
+			}()
+		}
+	}
+	svc, err := NewService(m, rt, tr, Config{Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+
+	got, err := svc.Request(context.Background(), dataReq(0, 1001))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetType() != pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE {
+		t.Fatalf("got %+v", got)
+	}
+	if rt.n.Load() < 2 || tr.sends.Load() < 2 {
+		t.Fatalf("routeCalls=%d sends=%d", rt.n.Load(), tr.sends.Load())
+	}
+	last := tr.lastMsg()
+	if last == nil || last.GetDestinationNodeId() != 3 {
+		t.Fatalf("last dest=%v want 3", last)
 	}
 }
 
@@ -383,6 +449,7 @@ func TestRequestTimeout(t *testing.T) {
 		t.Fatalf("tx not cleaned: %v", err)
 	}
 }
+
 
 func TestRequestContextCancel(t *testing.T) {
 	t.Parallel()
