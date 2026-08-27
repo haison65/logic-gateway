@@ -1,0 +1,21 @@
+# Master — Docker network. Listen all interfaces.
+node:
+  node_id: 1
+  instance_id: master-docker
+  name: master
+  type: master
+  group: local-server
+  ip: master
+
+http:
+  listen: 0.0.0.0
+  port: 9200
+
+heartbeat:
+  interval: 1000ms
+  timeout: 3000ms
+  dead_timeout: 6000ms
+
+resource:
+  cpu_cores: 1
+  memory: 512M

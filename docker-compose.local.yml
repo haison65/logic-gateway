@@ -1,0 +1,163 @@
+# Local deployment with REAL container resource limits (Phase 7).
+#
+# Target (application + cgroup):
+#   HTTP2GW: 4 CPU, 8G RAM
+#   Logic×2: 6 CPU, 8G RAM each
+#   Master:  1 CPU, 512M
+#
+# GOMAXPROCS = Go scheduler concurrency hint (NOT the cgroup CPU quota).
+# Actual CPU/memory enforcement = deploy.resources.limits / cpus / mem_limit.
+#
+# Prerequisites:
+#   - Docker Desktop → Settings → Resources: đủ CPU (≥16 khuyến nghị) và RAM (≥24G cho 8+8+8).
+#   - Nếu VM Docker < 24G: giảm mem_limit cho khớp VM (document trong report).
+#
+# Client/Performance chạy trên HOST (go run), không trong Compose — tránh vượt RAM.
+#
+# Usage:
+#   docker compose -f docker-compose.local.yml up -d --build
+#   docker stats
+#   curl.exe http://127.0.0.1:9200/v1/nodes
+#   go run ./cmd/client -config configs/local/perf-1.dev.yaml
+
+services:
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: master
+    image: logic-gateway/master:local
+    hostname: master
+    init: true
+    stop_grace_period: 10s
+    command: ["-config", "/configs/master.yaml", "-debug=false"]
+    environment:
+      - GOMAXPROCS=1
+    cpus: 1.0
+    mem_limit: 512m
+    ports:
+      - "9200:9200/tcp"
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  http2gw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: http2gw
+    image: logic-gateway/http2gw:local
+    hostname: http2gw
+    init: true
+    stop_grace_period: 10s
+    command: ["-config", "/configs/http2gw.yaml", "-debug=false"]
+    volumes:
+      - ./configs/local/http2gw.docker.yaml:/configs/http2gw.yaml:ro
+    environment:
+      # Soft concurrency hint only — cgroup limit is cpus: 4 below.
+      - GOMAXPROCS=4
+    cpus: 4.0
+    mem_limit: 8g
+    ports:
+      - "8080:8080/tcp"
+    depends_on:
+      - master
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  logic-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: logic
+    image: logic-gateway/logic:local
+    hostname: logic-1
+    init: true
+    stop_grace_period: 10s
+    command: ["-config", "/configs/logic.yaml", "-debug=false"]
+    volumes:
+      - ./configs/local/logic-1.docker.yaml:/configs/logic.yaml:ro
+    environment:
+      - GOMAXPROCS=6
+    cpus: 6.0
+    mem_limit: 8g
+    depends_on:
+      - http2gw
+      - master
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  logic-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: logic
+    image: logic-gateway/logic:local
+    hostname: logic-2
+    init: true
+    stop_grace_period: 10s
+    command: ["-config", "/configs/logic.yaml", "-debug=false"]
+    volumes:
+      - ./configs/local/logic-2.docker.yaml:/configs/logic.yaml:ro
+    environment:
+      - GOMAXPROCS=6
+    cpus: 6.0
+    mem_limit: 8g
+    depends_on:
+      - http2gw
+      - master
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    hostname: prometheus
+    init: true
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090/tcp"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - http2gw
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  app:
+    driver: bridge
+    name: logic-gateway-local
+
+volumes:
+  prometheus_data:

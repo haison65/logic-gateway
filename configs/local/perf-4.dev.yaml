@@ -1,0 +1,23 @@
+node:
+  node_id: 33
+  instance_id: perf-4
+  name: perf-4
+  type: performance
+  group: tool-client
+  ip: 127.0.0.1
+
+target: http://127.0.0.1:8080
+message_id: 1001
+session_id: perf4
+unique_session: true
+body: hello
+timeout: 10s
+concurrency: 8
+qps: 50
+duration: 30s
+n: 0
+master_url: http://127.0.0.1:9200
+
+resource:
+  cpu_cores: 1
+  memory: 512M
