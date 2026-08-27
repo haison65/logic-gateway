@@ -1,351 +1,222 @@
 # Hướng dẫn dựng môi trường và chạy E2E
 
-Tài liệu này mô tả cách chạy vòng:
-
-```text
-Client (cmd/client, HTTP/2)
-        │
-        ▼
-http2gw (HTTP :8080, UDP :9000)
-        │
-        ▼
-Logic   (UDP :9100, echo DATA 1001/1002/1003)
-        │
-        ▼
-http2gw ghép transaction_id
-        │
-        ▼
-Client nhận HTTP/2 200 + body
-```
-
-Vòng **client → http2gw → Logic echo** không cần `http.remote`. Trường `http.remote` chỉ dùng khi Logic gửi `DATA_REQUEST` ra gateway để gateway gọi HTTP/2 tới server khác (xem mục 8).
-
-Mọi lệnh chạy từ thư mục repo:
-
-```text
-d:\Golang\project\logic-gateway
-```
-
-Dùng PowerShell. Không dùng `curl`; client E2E là `cmd/client`.
+Tài liệu **quick start** local. Topology đầy đủ (Master, 2 Logic, scripts, failover): [`local_deployment.md`](local_deployment.md).  
+Docker / Compose: [`docker.md`](docker.md). Resource limits: [`resource_model.md`](resource_model.md).  
+Prometheus + report: [`huong_dan_prometheus_report.md`](huong_dan_prometheus_report.md).  
+**Nếu lệch code, lấy code làm chuẩn.** README cũng mô tả API/kiến trúc.
 
 ---
 
+## Luồng cơ bản
 
+```text
+Client (cmd/client, HTTP/2 h2c)
+        │  POST /v1/data
+        ▼
+http2gw (TCP :8080, UDP :9000)
+        │  UDP protobuf DATA_REQUEST
+        ▼
+Logic   (UDP :9100 / :9101, echo 1001/1002/1003)
+        │  DATA_RESPONSE + transaction_id
+        ▼
+http2gw → HTTP/2 200 + body → Client
+```
+
+Không cần `http.remote` cho vòng echo này. `http.remote` chỉ cho chiều Logic → GW → HTTP remote (mục 8).
+
+Mọi lệnh từ root repo (`d:\Golang\project\logic-gateway`), PowerShell.
+
+---
 
 ## 1. Yêu cầu
 
 - Go trên `PATH` (`go version`)
-- Source đã generate protobuf (`proto/gen/go/` đã có trong repo)
-- Cổng trống:
+- `proto/gen/go/` đã có trong repo
+- Cổng trống (topology tối thiểu / đầy đủ):
 
-  | Process | Bind             | Vai trò                          |
-  | ------- | ---------------- | -------------------------------- |
-  | http2gw | `127.0.0.1:8080` | HTTP/2 (h2c) nhận client         |
-  | http2gw | `127.0.0.1:9000` | UDP: REGISTER / HEARTBEAT / DATA |
-  | logic   | `127.0.0.1:9100` | UDP Logic, `node_id: 2`          |
-
-
-Kiểm tra cổng:
+| Process | Bind (local) | Vai trò |
+|---------|----------------|---------|
+| master | `127.0.0.1:9200` | Control-plane inventory (tuỳ chọn khi dùng `configs/local`) |
+| http2gw | `127.0.0.1:8080` | HTTP/2 h2c |
+| http2gw | `127.0.0.1:9000` | UDP REGISTER / HEARTBEAT / DATA |
+| logic-1 | `127.0.0.1:9100` | Logic `node_id=2` |
+| logic-2 | `127.0.0.1:9101` | Logic `node_id=3` (topology đầy đủ) |
 
 ```powershell
-netstat -ano | findstr "8080 9000 9100"
+netstat -ano | findstr "8080 9000 9100 9101 9200"
 ```
-
-Nếu cổng bị chiếm, tắt process cũ hoặc đổi port trong `configs/*.dev.yaml`.
-
-Config dùng cho local:
-
-- `configs/http2gw.dev.yaml`
-- `configs/logic.dev.yaml`
 
 ---
 
-
-
-## 2. Test E2E tự động (không cần chạy binary)
-
-Không chiếm cổng 8080/9000/9100. Go tự mở UDP + HTTP/2 + Logic echo.
+## 2. Cách nhanh nhất — topology đầy đủ (khuyến nghị)
 
 ```powershell
-cd d:\Golang\project\logic-gateway
-go test ./internal/logicnode -run TestHTTPClientEchoViaLogic -v
+.\scripts\start_local.ps1
+.\scripts\status_local.ps1
+
+go run ./cmd/client -n 1 -unique-session -body hello
+
+.\scripts\load_local.ps1
+.\scripts\stop_local.ps1
 ```
 
-Kỳ vọng: `PASS`. Test kiểm tra:
+Script dùng `configs/local/*` (Master + GW + 2 Logic). Chi tiết lệnh / failover drill: [`local_deployment.md`](local_deployment.md).
 
-- client ↔ http2gw là HTTP/2
-- body được echo
-- có header `X-Transaction-Id`
+Window debug (mỗi process một cửa sổ): `.\scripts\start_local_p0.ps1`.
 
 ---
 
-
-
-## 3. E2E chạy tay với `cmd/client`
-
-Cần **3 terminal**. Thứ tự bắt buộc: **http2gw → logic → client**.
-
-### Terminal 1 — http2gw
+## 3. Test E2E tự động (không cần chạy binary)
 
 ```powershell
-cd d:\Golang\project\logic-gateway
+go test ./internal/logicnode -run "TestHTTPClientEchoViaLogic|TestE2EFailoverWhenLogicMarkedDead" -v
+```
+
+- `TestHTTPClientEchoViaLogic` — 1 Logic, HTTP/2 + echo + `X-Transaction-Id`
+- `TestE2EFailoverWhenLogicMarkedDead` — 2 Logic, một node bị loại, request mới vẫn 200
+
+---
+
+## 4. E2E tay — tối thiểu (1 GW + 1 Logic)
+
+Thứ tự: **http2gw → logic → client**.
+
+**Terminal 1 — http2gw**
+
+```powershell
 go run ./cmd/http2gw -config configs/http2gw.dev.yaml
 ```
 
-Mặc định `-debug=true`: mỗi request in `http data in/out` (kèm `body`/`payload`), `tx create/route/send/complete`, `udp data response` (kèm `payload`). Tắt: `-debug=false`.
+Log cần: UDP `127.0.0.1:9000`, HTTP `127.0.0.1:8080`. `-debug=false` để giảm log khi tải.
 
-Log JSON (zap) gồm `time`, `level`, `module`, `line`, `Message`. Ví dụ `module` là `http2gw`, `http2gw.httpsrv`, `http2gw.dispatch`, `http2gw.transaction`.
-
-Log cần có: đang lắng nghe UDP `127.0.0.1:9000` và HTTP `127.0.0.1:8080`.
-
-Để terminal này chạy. Không Ctrl+C.
-
-### Terminal 2 — logic
+**Terminal 2 — logic**
 
 ```powershell
-cd d:\Golang\project\logic-gateway
 go run ./cmd/logic -config configs/logic.dev.yaml
 ```
 
-Mặc định `-debug=true`: mỗi DATA in `udp data request` và `udp data out`. Tắt: `-debug=false`.
+Log cần: `logic đã đăng ký`. Đợi ~1s để HEARTBEAT → **ACTIVE** (trước đó client có thể nhận **503**).
 
-Log JSON gồm `time`, `level`, `module` (`logic`), `line`, `Message`.
-
-Log cần có: `logic đã đăng ký`.
-
-Đợi khoảng **1 giây** để HEARTBEAT đưa node sang trạng thái **ACTIVE**. Router chỉ chọn node ACTIVE. Gọi client trước lúc này sẽ nhận HTTP **503**.
-
-Để terminal này chạy.
-
-### Terminal 3 — client Go (một request)
+**Terminal 3 — client**
 
 ```powershell
-cd d:\Golang\project\logic-gateway
 go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -session-id sess-1 -body hello
 ```
 
-Kỳ vọng:
+Kỳ vọng: `proto: HTTP/2`, `status: 200`, `body: hello`, có `X-Transaction-Id`.
 
-```text
-proto: HTTP/2
-status: 200
-X-Transaction-Id: <số>
-latency: ...
-body: hello
+`message-id` hợp lệ: `1001` / `1002` / `1003`. Id khác → thường HTTP **502**.
+
+### 2 Logic tay (không script)
+
+```powershell
+go run ./cmd/http2gw -config configs/local/http2gw.dev.yaml
+go run ./cmd/logic -config configs/local/logic-1.dev.yaml
+go run ./cmd/logic -config configs/local/logic-2.dev.yaml
+# (tuỳ chọn) go run ./cmd/master -config configs/local/master.dev.yaml
+go run ./cmd/client -n 1 -unique-session -body hello
 ```
-
-Ý nghĩa:
-
-- `proto: HTTP/2` — client nói HTTP/2 (h2c) với http2gw
-- `X-Transaction-Id` — UDP `DATA_RESPONSE` đã được ghép
-- `body: hello` — Logic echo payload (`message_id` 1001/1002/1003)
-
-`X-Message-Id` phải là `1001`, `1002` hoặc `1003` (Logic quảng bá trong yaml). Id khác: Logic trả Envelope ERROR trên UDP, client thường nhận HTTP **502**.
 
 ---
 
+## 5. Đẩy tải
 
-
-## 4. Đẩy tải bằng cùng client
-
-http2gw và logic vẫn chạy. Terminal 3:
+GW + Logic đang chạy:
 
 ```powershell
 go run ./cmd/client -n 100 -c 10
 go run ./cmd/client -n 1000 -c 50 -unique-session
-go run ./cmd/client -d 10s -c 20
-go run ./cmd/client -n 5000 -c 50 -qps 200 -v
+go run ./cmd/client -d 10s -c 20 -qps 100 -v
+
+# Identity YAML (2 Http2-client + 4 Performance)
+.\scripts\load_local.ps1
+.\scripts\load_local.ps1 -Duration 60s
 ```
 
-Client dùng **một kết nối HTTP/2**, nhiều stream song song.
+| Cờ | Mặc định | Ý nghĩa |
+|----|----------|---------|
+| `-addr` | `http://127.0.0.1:8080` | http2gw |
+| `-config` | (trống) | YAML LoadClient (`configs/local/perf-*.yaml`, …) |
+| `-message-id` | `1001` | `X-Message-Id` |
+| `-session-id` | `sess-1` | Consistent-hash |
+| `-unique-session` | `false` | Trải nhiều Logic |
+| `-n` / `-c` / `-d` / `-qps` | `1` / `1` / `0` / `0` | Số request / concurrency / duration / trần QPS |
+| `-v` | `false` | In từng lỗi |
 
-Kỳ vọng: `fail: 0`, `ok` bằng tổng request, `http2` gần bằng số request.
-
-Dừng tải: Ctrl+C ở terminal client. Dừng hệ thống: Ctrl+C logic, rồi http2gw.
-
-### Cờ `cmd/client`
-
-
-| Cờ                | Mặc định                | Ý nghĩa                                               |
-| ----------------- | ----------------------- | ----------------------------------------------------- |
-| `-addr`           | `http://127.0.0.1:8080` | Địa chỉ http2gw                                       |
-| `-message-id`     | `1001`                  | `X-Message-Id`                                        |
-| `-session-id`     | `sess-1`                | `X-Session-Id` (consistent-hash)                      |
-| `-unique-session` | `false`                 | Mỗi request một session-id (trải nhiều Logic)         |
-| `-trace-id`       | tự tạo                  | `X-Trace-Id`                                          |
-| `-body`           | `hello`                 | Payload gửi Logic                                     |
-| `-timeout`        | `10s`                   | Timeout từng request                                  |
-| `-n`              | `1`                     | Tổng số request (`0` = không giới hạn, dùng với `-d`) |
-| `-c`              | `1`                     | Số goroutine / stream đồng thời                       |
-| `-d`              | `0`                     | Chạy theo thời gian, ví dụ `10s`                      |
-| `-qps`            | `0`                     | Trần request/giây (`0` = không giới hạn)              |
-| `-v`              | `false`                 | In từng request lỗi khi đẩy tải                       |
-
-
-Khi `-n 1 -c 1` (không `-d`): in chi tiết một response. Khi đẩy tải: in `ok/fail/http2/rps` và latency min/avg/p50/p95/p99/max. Có fail thì exit code 1.
+`-n 1 -c 1` (không `-d`): in chi tiết một response. Load: in ok/fail/rps + latency percentiles.
 
 ---
 
-
-
-## 5. Luồng một request
+## 6. Luồng một request (tóm tắt)
 
 ```text
 cmd/client  --HTTP/2 POST /v1/data-->  http2gw :8080
-http2gw     --UDP DATA_REQUEST------>  logic  :9100
+http2gw     --UDP DATA_REQUEST------>  Logic ACTIVE
 logic       --UDP DATA_RESPONSE----->  http2gw :9000
 http2gw     --HTTP/2 200 + body----->  cmd/client
 ```
 
-http2gw:
-
-1. `POST /v1/data` → Envelope `DATA_REQUEST`
-2. Transaction Manager cấp `transaction_id` **trước** khi Send
-3. Router chọn Logic `ACTIVE` hỗ trợ `message_id`
-4. UDP Send một datagram
-5. Wait
-6. Vòng Receive duy nhất: `DATA_RESPONSE` → `OnResponse` → Complete
-7. Trả HTTP/2 cho client
-
-Logic:
-
-1. REGISTER tới `127.0.0.1:9000`
-2. HEARTBEAT định kỳ → `ACTIVE`
-3. Mỗi `DATA_REQUEST` với `message_id` 1001/1002/1003 echo `DATA_RESPONSE` (cùng `transaction_id` và payload). Spec chưa định nghĩa nghiệp vụ CREATE/UPDATE/DELETE — local chỉ echo.
+http2gw: Create `transaction_id` → Route (ACTIVE Logic + message_id) → UDP Send → Wait → Complete.  
+Có failover tối đa 1 lần (Send fail / timeout) — exclude node vừa fail.  
+Logic: REGISTER → HEARTBEAT → ACTIVE; echo 1001/1002/1003.
 
 ---
 
+## 7. Lỗi thường gặp
 
-
-## 6. Lỗi thường gặp
-
-
-| Hiện tượng                      | Nguyên nhân / cách xử lý                                                           |
-| ------------------------------- | ---------------------------------------------------------------------------------- |
-| `connection refused`            | Terminal 1 chưa chạy, hoặc sai `-addr`                                             |
-| `bind: address already in use`  | Cổng 8080/9000/9100 đang bị chiếm                                                  |
-| `không đọc được cấu hình`       | Không chạy từ root repo, sai đường dẫn `-config`                                   |
-| HTTP **503** `no eligible node` | Logic chưa lên, chưa REGISTER, hoặc chưa HEARTBEAT (chưa ACTIVE)                   |
-| HTTP **504**                    | Logic không echo / UDP không tới `node.ip:port`                                    |
-| HTTP **502**                    | Envelope không phải `DATA_RESPONSE` (ví dụ `message-id` lạ), UDP lỗi, manager đóng |
-| HTTP **400**                    | Thiếu hoặc sai `-message-id`                                                       |
-| `cảnh báo: không phải HTTP/2`   | Không dùng `cmd/client` (ví dụ HTTP/1.1 default client)                            |
-
-
-Windows Firewall với `127.0.0.1` thường không chặn. Nếu UDP lạ, cho phép Go với Private network.
+| Hiện tượng | Xử lý |
+|------------|--------|
+| `connection refused` | GW chưa chạy / sai `-addr` |
+| `bind: address already in use` | Cổng bị chiếm — `stop_local` hoặc tắt process cũ |
+| HTTP **503** | Logic chưa ACTIVE / cả pool DEAD |
+| HTTP **504** | Timeout chờ DATA_RESPONSE |
+| HTTP **502** | `message-id` lạ / UDP lỗi |
+| HTTP **400** | Thiếu `X-Message-Id` |
+| Master không thấy node | Chưa set `master_url` trong YAML / Master chưa listen `:9200` |
 
 ---
 
-
-
-## 7. Health và metrics
-
-`GET /healthz` — process còn sống:
+## 8. Health và metrics
 
 ```powershell
 curl.exe -s http://127.0.0.1:8080/healthz
+curl.exe -s http://127.0.0.1:8080/ready
+curl.exe -s http://127.0.0.1:8080/metrics | findstr http2gw_
+curl.exe -s http://127.0.0.1:8080/metrics.json
+
+# Khi chạy Master
+curl.exe -s http://127.0.0.1:9200/healthz
+curl.exe -s http://127.0.0.1:9200/v1/nodes
 ```
 
-Kỳ vọng: `{"status":"ok"}`.
+- `/metrics` — Prometheus (`http2gw_*`, gồm `logic_nodes{state=...}`)
+- `/metrics.json` — snapshot JSON (request, fail reason, latency, UDP/HB counters)
 
-`GET /metrics` — JSON gồm thống kê `POST /v1/data` **và** các bộ đếm thiết kế (`logic_registered_total`, `heartbeat_`*, `udp_rx_total` / `udp_tx_total`, `route_failed_total`, `transaction_timeout_total`). Không tính `/healthz` hay `/metrics` vào `requests_*`.
-
-```powershell
-curl.exe -s http://127.0.0.1:8080/metrics
-```
-
-Ví dụ:
-
-```json
-{
-  "requests_total": 1000,
-  "requests_ok": 995,
-  "requests_fail": 5,
-  "in_flight": 0,
-  "by_status": { "200": 995, "400": 1, "503": 2, "504": 2 },
-  "fail_by_code": {
-    "400": 1,
-    "413": 0,
-    "499": 0,
-    "502": 0,
-    "503": 2,
-    "504": 2
-  },
-  "fail_by_reason": {
-    "missing_message_id": 1,
-    "no_routing_target": 2,
-    "timeout": 2,
-    "invalid_body": 0,
-    "body_too_large": 0,
-    "invalid_request": 0,
-    "invalid_node": 0,
-    "canceled": 0,
-    "empty_response": 0,
-    "udp_send_failed": 0,
-    "manager_closed": 0,
-    "logic_error": 0,
-    "unknown": 0
-  },
-  "latency": {
-    "count": 1000,
-    "min_ms": 1.2,
-    "max_ms": 48.0,
-    "avg_ms": 8.5,
-    "sum_ms": 8500
-  },
-  "logic_registered_total": 1,
-  "heartbeat_success_total": 12,
-  "heartbeat_timeout_total": 0,
-  "udp_rx_total": 20,
-  "udp_tx_total": 8,
-  "route_failed_total": 2,
-  "transaction_timeout_total": 2
-}
-```
-
-`requests_fail` là tổng. Chi tiết:
-
-
-| HTTP             | `fail_by_reason`                                                    | Khi nào                                                                 |
-| ---------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| 400              | `missing_message_id`                                                | Thiếu/sai `X-Message-Id`                                                |
-| 400              | `invalid_body`                                                      | Không đọc được body                                                     |
-| 400              | `invalid_request` / `invalid_node`                                  | Envelope/node đích không hợp lệ                                         |
-| 413              | `body_too_large`                                                    | Body > 1 MiB                                                            |
-| 499              | `canceled`                                                          | Client hủy                                                              |
-| 502              | `udp_send_failed` / `empty_response` / `manager_closed` / `unknown` | Gửi UDP lỗi, không có `DATA_RESPONSE`, manager đóng, lỗi chưa phân loại |
-| 503              | `no_routing_target`                                                 | Không có Logic ACTIVE                                                   |
-| 504              | `timeout`                                                           | Hết `transaction.timeout`                                               |
-| 4xx/5xx từ Logic | `logic_error`                                                       | `DataResponse.status` lỗi                                               |
-
-
-Các khóa trong `fail_by_code` / `fail_by_reason` luôn có mặt; giá trị `0` nếu chưa xảy ra.
-
-`latency` đo từ lúc vào `handleData` đến lúc ghi xong HTTP (gồm Route + UDP Send + Wait). Số liệu cộng dồn từ lúc process start. Vòng DATA inbound vẫn nên dùng `cmd/client` để đảm bảo HTTP/2.
+Chi tiết PromQL / checklist report: [`huong_dan_prometheus_report.md`](huong_dan_prometheus_report.md).
 
 ---
 
+## 9. Chiều Logic → HTTP/2 remote (không bắt buộc)
 
+Logic gửi `DATA_REQUEST` UDP → http2gw gọi HTTP/2 tới `http.remote` → trả `DATA_RESPONSE` / ERROR về Logic.
 
-## 8. Chiều Logic → HTTP/2 remote (không bắt buộc cho mục 3)
+- `configs/http2gw.dev.yaml` thường **để trống** `remote` → outbound nhận `NO_ROUTING_TARGET`
+- Request: `POST {remote}/v1/data` + header message/session/trace/transaction
 
-Design có chiều: Logic gửi `DATA_REQUEST` UDP → http2gw gọi **HTTP/2 Client** → remote → `DATA_RESPONSE` (hoặc Envelope ERROR) về Logic.
+Không cần mục này để chạy echo local với `cmd/client`.
 
-- Cấu hình: `http.remote` (base URL), ví dụ `http://127.0.0.1:9090`.
-- `configs/http2gw.dev.yaml` **không** set `remote` → để trống. Logic gọi outbound sẽ nhận ERROR `NO_ROUTING_TARGET`.
-- Request: `POST {remote}/v1/data`, header `X-Message-Id` / `X-Session-Id` / `X-Trace-Id` / `X-Transaction-Id`, body = payload. `http://` dùng h2c (HTTP/2 prior-knowledge), cùng kiểu client `cmd/client`.
-- HTTP 4xx/5xx: vẫn `DATA_RESPONSE` với `status` = mã HTTP. Timeout / không kết nối được: Envelope ERROR trên UDP.
-- URL/path không có trong design; đây là quy ước triển khai, không đổi spec.
+---
 
-Không cần mục này để chạy `cmd/client` echo local.
+## 10. Docker
 
-------------------------------------------------------------------------
-
-## 9. Docker Compose (hai container)
-
-Xem [docker.md](docker.md): start/stop, cổng publish vs nội bộ, logs, tải, troubleshooting (DNS, REGISTER, DEAD/503, port 8080).
+Xem [`docker.md`](docker.md).
 
 ```powershell
+# Tối thiểu: 1 GW + 1 Logic + Prometheus
 docker compose up --build -d
-go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -session-id sess-1 -body hello
+
+# Đầy đủ + CPU/mem limit: Master + GW + 2 Logic + Prometheus
+docker compose -f docker-compose.local.yml up -d --build
+
+go run ./cmd/client -addr http://127.0.0.1:8080 -message-id 1001 -unique-session -body hello
 ```
