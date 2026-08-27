@@ -77,7 +77,10 @@ func New(cfg Config, tx Requester, log *zap.Logger, met *metrics.Metrics) (*Serv
 	s := &Server{cfg: cfg, tx: tx, log: log, metrics: met}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
-	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /ready", s.handleReady)
+	mux.Handle("GET /metrics", met.Handler())
+	mux.HandleFunc("GET /metrics.json", s.handleMetricsJSON)
 	mux.HandleFunc("POST /v1/data", s.handleData)
 	h2s := &http2.Server{}
 	s.http = &http.Server{
@@ -135,7 +138,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+func (s *Server) handleMetricsJSON(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.metrics.Snapshot())
 }

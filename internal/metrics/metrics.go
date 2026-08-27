@@ -72,6 +72,7 @@ type LatencyStats struct {
 }
 
 // Metrics đếm request http2gw, an toàn khi nhiều goroutine.
+// Snapshot JSON và Prometheus exposition cùng được cập nhật (dual-write).
 type Metrics struct {
 	mu           sync.Mutex
 	total        int64
@@ -92,14 +93,17 @@ type Metrics struct {
 	udpTxTotal              int64
 	routeFailedTotal        int64
 	transactionTimeoutTotal int64
+
+	prom *promCollectors
 }
 
-// New tạo bộ đếm rỗng.
+// New tạo bộ đếm rỗng + registry Prometheus riêng (an toàn khi test song song).
 func New() *Metrics {
 	return &Metrics{
 		byStatus:     make(map[int]int64),
 		failByCode:   make(map[int]int64),
 		failByReason: make(map[string]int64),
+		prom:         newPromCollectors(),
 	}
 }
 
@@ -113,7 +117,11 @@ func (m *Metrics) AddInFlight(delta int64) {
 	if m.inFlight < 0 {
 		m.inFlight = 0
 	}
+	cur := m.inFlight
 	m.mu.Unlock()
+	if m.prom != nil {
+		m.prom.inFlight.Set(float64(cur))
+	}
 }
 
 // Observe ghi nhận một request đã hoàn tất.
@@ -126,7 +134,6 @@ func (m *Metrics) Observe(d time.Duration, status int, reason string) {
 		d = 0
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.total++
 	m.sum += d
 	if m.min == 0 || d < m.min {
@@ -139,22 +146,28 @@ func (m *Metrics) Observe(d time.Duration, status int, reason string) {
 		m.byStatus = make(map[int]int64)
 	}
 	m.byStatus[status]++
-	if status >= 200 && status < 400 {
+	ok := status >= 200 && status < 400
+	if ok {
 		m.ok++
-		return
+	} else {
+		m.fail++
+		if m.failByCode == nil {
+			m.failByCode = make(map[int]int64)
+		}
+		m.failByCode[status]++
+		if reason == "" || reason == ReasonOK {
+			reason = ReasonUnknown
+		}
+		if m.failByReason == nil {
+			m.failByReason = make(map[string]int64)
+		}
+		m.failByReason[reason]++
 	}
-	m.fail++
-	if m.failByCode == nil {
-		m.failByCode = make(map[int]int64)
-	}
-	m.failByCode[status]++
-	if reason == "" || reason == ReasonOK {
+	m.mu.Unlock()
+	if !ok && (reason == "" || reason == ReasonOK) {
 		reason = ReasonUnknown
 	}
-	if m.failByReason == nil {
-		m.failByReason = make(map[string]int64)
-	}
-	m.failByReason[reason]++
+	m.observeProm(d.Seconds(), status, reason, ok)
 }
 
 func (m *Metrics) AddLogicRegistered(n int64) {
@@ -164,6 +177,9 @@ func (m *Metrics) AddLogicRegistered(n int64) {
 	m.mu.Lock()
 	m.logicRegisteredTotal += n
 	m.mu.Unlock()
+	if m.prom != nil && n > 0 {
+		m.prom.logicRegistered.Add(float64(n))
+	}
 }
 
 func (m *Metrics) AddHeartbeatSuccess(n int64) {
@@ -173,6 +189,9 @@ func (m *Metrics) AddHeartbeatSuccess(n int64) {
 	m.mu.Lock()
 	m.heartbeatSuccessTotal += n
 	m.mu.Unlock()
+	if m.prom != nil && n > 0 {
+		m.prom.heartbeatSuccess.Add(float64(n))
+	}
 }
 
 func (m *Metrics) AddHeartbeatTimeout(n int64) {
@@ -182,6 +201,9 @@ func (m *Metrics) AddHeartbeatTimeout(n int64) {
 	m.mu.Lock()
 	m.heartbeatTimeoutTotal += n
 	m.mu.Unlock()
+	if m.prom != nil && n > 0 {
+		m.prom.heartbeatTimeout.Add(float64(n))
+	}
 }
 
 func (m *Metrics) AddUDPRx(n int64) {
@@ -191,6 +213,9 @@ func (m *Metrics) AddUDPRx(n int64) {
 	m.mu.Lock()
 	m.udpRxTotal += n
 	m.mu.Unlock()
+	if m.prom != nil && n > 0 {
+		m.prom.udpRx.Add(float64(n))
+	}
 }
 
 func (m *Metrics) AddUDPTx(n int64) {
@@ -200,6 +225,9 @@ func (m *Metrics) AddUDPTx(n int64) {
 	m.mu.Lock()
 	m.udpTxTotal += n
 	m.mu.Unlock()
+	if m.prom != nil && n > 0 {
+		m.prom.udpTx.Add(float64(n))
+	}
 }
 
 func (m *Metrics) AddRouteFailed(n int64) {
@@ -209,6 +237,9 @@ func (m *Metrics) AddRouteFailed(n int64) {
 	m.mu.Lock()
 	m.routeFailedTotal += n
 	m.mu.Unlock()
+	if m.prom != nil && n > 0 {
+		m.prom.routeFailed.Add(float64(n))
+	}
 }
 
 func (m *Metrics) AddTransactionTimeout(n int64) {
@@ -218,6 +249,27 @@ func (m *Metrics) AddTransactionTimeout(n int64) {
 	m.mu.Lock()
 	m.transactionTimeoutTotal += n
 	m.mu.Unlock()
+	if m.prom != nil && n > 0 {
+		m.prom.transactionTimeout.Add(float64(n))
+	}
+}
+
+// ObserveLogicRegistry cập nhật gauge số Logic theo state (DATA-plane registry).
+func (m *Metrics) ObserveLogicRegistry(byState map[string]int) {
+	if m == nil || m.prom == nil {
+		return
+	}
+	for _, st := range []string{"registered", "active", "suspect", "dead", "init"} {
+		m.prom.logicNodes.WithLabelValues(st).Set(float64(byState[st]))
+	}
+}
+
+// AddFailoverRetry đếm lần failover retry (Send fail / timeout).
+func (m *Metrics) AddFailoverRetry(n int64) {
+	if m == nil || m.prom == nil || n <= 0 {
+		return
+	}
+	m.prom.failoverRetryTotal.Add(float64(n))
 }
 
 // Snapshot copy số liệu hiện tại. fail_by_code / fail_by_reason luôn có đủ khóa đã biết (0 nếu chưa xảy ra).

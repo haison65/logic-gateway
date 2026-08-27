@@ -39,7 +39,36 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    hostname: prometheus
+    init: true
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090/tcp"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - http2gw
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   app:
     driver: bridge
     name: logic-gateway-app
+
+volumes:
+  prometheus_data:

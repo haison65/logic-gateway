@@ -84,14 +84,14 @@ func TestHealthAndData(t *testing.T) {
 		t.Fatalf("tx header = %s", got.Header.Get("X-Transaction-Id"))
 	}
 
-	mresp, err := http.Get("http://" + addr + "/metrics")
+	mresp, err := http.Get("http://" + addr + "/metrics.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := io.ReadAll(mresp.Body)
 	_ = mresp.Body.Close()
 	if mresp.StatusCode != 200 {
-		t.Fatalf("metrics status = %d", mresp.StatusCode)
+		t.Fatalf("metrics.json status = %d", mresp.StatusCode)
 	}
 	var st metrics.RequestStats
 	if err := json.Unmarshal(raw, &st); err != nil {
@@ -104,6 +104,19 @@ func TestHealthAndData(t *testing.T) {
 		t.Fatalf("latency = %+v", st.Latency)
 	}
 
+	promResp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	promBody, _ := io.ReadAll(promResp.Body)
+	_ = promResp.Body.Close()
+	if promResp.StatusCode != 200 {
+		t.Fatalf("prometheus /metrics status = %d", promResp.StatusCode)
+	}
+	if !bytes.Contains(promBody, []byte("http2gw_http_requests_total")) {
+		t.Fatalf("prometheus body missing http2gw_http_requests_total: %s", promBody)
+	}
+
 	bad, err := http.Post("http://"+addr+"/v1/data", "application/octet-stream", bytes.NewReader([]byte("x")))
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +125,7 @@ func TestHealthAndData(t *testing.T) {
 	if bad.StatusCode != http.StatusBadRequest {
 		t.Fatalf("bad status = %d", bad.StatusCode)
 	}
-	mresp2, err := http.Get("http://" + addr + "/metrics")
+	mresp2, err := http.Get("http://" + addr + "/metrics.json")
 	if err != nil {
 		t.Fatal(err)
 	}
