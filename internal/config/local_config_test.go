@@ -48,7 +48,7 @@ func TestLoadLocalTopologyConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gw.Node.NodeID != 10 || gw.Resource.CPUCores != 4 || gw.Resource.MemoryBytes() != 8<<30 {
+	if gw.Node.NodeID != 10 || gw.Resource.CPUCores != 1 || gw.Resource.MemoryBytes() != 2<<30 {
 		t.Fatalf("http2gw local = %+v", gw)
 	}
 	if gw.MasterURL != "http://127.0.0.1:9200" {
