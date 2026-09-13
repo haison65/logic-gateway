@@ -39,14 +39,20 @@ func Run(ctx context.Context, cfg config.HTTP2GW, log *zap.Logger) error {
 	log = logger.OrNop(log)
 
 	conn, err := udp.New(udp.Config{
-		ListenHost: cfg.UDP.Listen,
-		ListenPort: cfg.UDP.Port,
+		ListenHost:       cfg.UDP.Listen,
+		ListenPort:       cfg.UDP.Port,
+		ReadBufferSize:   udp.DefaultSocketBufferSize,
+		WriteBufferSize:  udp.DefaultSocketBufferSize,
+		SendBatchSize:    64,
+		SendBatchWait:    100 * time.Microsecond,
+		ReceiveBatchSize: udp.DefaultReceiveBatchSize,
 	})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
 	log.Info("http2gw đang lắng nghe UDP", zap.Stringer("addr", conn.LocalAddr()))
+	logUDPBufferReport(log, conn)
 
 	met := metrics.New()
 	regStore := registry.NewMemory()
@@ -79,8 +85,10 @@ func Run(ctx context.Context, cfg config.HTTP2GW, log *zap.Logger) error {
 
 	rt := router.New(regStore, newStrategy(cfg.StrategyName()))
 	txMgr := transaction.NewManager()
+	txMgr.SetMetrics(met)
 	txSvc, err := transaction.NewService(txMgr, rt, conn, transaction.Config{
 		Timeout: cfg.Transaction.Timeout.Duration(),
+		Metrics: met,
 	})
 	if err != nil {
 		return err
@@ -88,16 +96,22 @@ func Run(ctx context.Context, cfg config.HTTP2GW, log *zap.Logger) error {
 	defer func() { _ = txSvc.Close() }()
 
 	ob := outbound.New(cfg.HTTP.Remote, cfg.Transaction.Timeout.Duration(), nil)
-	disp, err := dispatch.New(cfg.Node.NodeID, conn, regSvc, hbSvc, txSvc, log.Named("dispatch"), ob, met)
+	disp, err := dispatch.New(cfg.Node.NodeID, conn, regSvc, hbSvc, txSvc, log.Named("dispatch"), ob, met, dispatch.Config{
+		InboundQueueSize: cfg.UDP.InboundQueueSize,
+		InboundWorkers:   cfg.UDP.InboundWorkers,
+	})
 	if err != nil {
 		return err
 	}
 	httpSrv, err := httpsrv.New(httpsrv.Config{
-		NodeID:  cfg.Node.NodeID,
-		Listen:  cfg.HTTP.Listen,
-		Port:    cfg.HTTP.Port,
-		TLSCert: cfg.HTTP.TLSCert,
-		TLSKey:  cfg.HTTP.TLSKey,
+		NodeID:      cfg.Node.NodeID,
+		Listen:      cfg.HTTP.Listen,
+		Port:        cfg.HTTP.Port,
+		TLSCert:     cfg.HTTP.TLSCert,
+		TLSKey:      cfg.HTTP.TLSKey,
+		MaxRPS:      cfg.HTTP.MaxRPS,
+		MaxRPSBurst: cfg.HTTP.MaxRPSBurst,
+		MaxPending:  cfg.HTTP.MaxPending,
 	}, txSvc, log.Named("httpsrv"), met)
 	if err != nil {
 		return err
@@ -105,6 +119,10 @@ func Run(ctx context.Context, cfg config.HTTP2GW, log *zap.Logger) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	if err := httpsrv.StartPprofListen(runCtx, cfg.HTTP.PprofListen, log.Named("pprof")); err != nil {
+		return fmt.Errorf("pprof listen: %w", err)
+	}
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 6)
@@ -257,4 +275,37 @@ func registerSelf(reg *registration.Service, cfg config.HTTP2GW, conn udp.Transp
 		return fmt.Errorf("http2gw register rejected")
 	}
 	return nil
+}
+
+// logUDPBufferReport: configured ≠ actual — benchmark phải nhìn actual_*_after_force.
+func logUDPBufferReport(log *zap.Logger, conn *udp.Conn) {
+	if log == nil || conn == nil {
+		return
+	}
+	rep := conn.BufferApplyReport()
+	fields := []zap.Field{
+		zap.Int("configured_rcvbuf", rep.ConfiguredRcvbuf),
+		zap.Int("requested_rcvbuf", rep.RequestedRcvbuf),
+		zap.Int("actual_rcvbuf_before_force", rep.ActualRcvbufBeforeForce),
+		zap.Int("actual_rcvbuf_after_force", rep.ActualRcvbufAfterForce),
+		zap.Int("configured_sndbuf", rep.ConfiguredSndbuf),
+		zap.Int("requested_sndbuf", rep.RequestedSndbuf),
+		zap.Int("actual_sndbuf_before_force", rep.ActualSndbufBeforeForce),
+		zap.Int("actual_sndbuf_after_force", rep.ActualSndbufAfterForce),
+		zap.Bool("forced", rep.Forced),
+		zap.Int("receive_batch_size", conn.ReceiveBatchSize()),
+	}
+	if rep.ForceError != nil {
+		fields = append(fields, zap.Error(rep.ForceError), zap.String("force_error", rep.ForceError.Error()))
+		log.Warn("udp socket buffers", fields...)
+		return
+	}
+	log.Info("udp socket buffers", fields...)
+	// Linux thường ×2: request 32MiB → actual ~64MiB. Cảnh báo nếu vẫn clamp ~416KiB.
+	if rep.ConfiguredRcvbuf > 0 && rep.ActualRcvbufAfterForce > 0 && rep.ActualRcvbufAfterForce < 1024*1024 {
+		log.Warn("udp SO_RCVBUF actual still < 1MiB after force — Case B risk; check user root + CAP_NET_ADMIN",
+			zap.Int("actual_rcvbuf_after_force", rep.ActualRcvbufAfterForce),
+			zap.Int("configured_rcvbuf", rep.ConfiguredRcvbuf),
+		)
+	}
 }

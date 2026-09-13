@@ -42,7 +42,7 @@ func TestHTTPClientEchoViaLogic(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = txSvc.Close() })
 
-	disp, err := dispatch.New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), txSvc, log, nil, nil)
+	disp, err := dispatch.New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), txSvc, log, nil, nil, dispatch.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestE2EFailoverWhenLogicMarkedDead(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = txSvc.Close() })
 
-	disp, err := dispatch.New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), txSvc, log, nil, nil)
+	disp, err := dispatch.New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), txSvc, log, nil, nil, dispatch.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

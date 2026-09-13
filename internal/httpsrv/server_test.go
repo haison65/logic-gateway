@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/haison65/logic-gateway/internal/metrics"
+	"github.com/haison65/logic-gateway/internal/transaction"
 
 	pb "github.com/haison65/logic-gateway/proto/gen/go"
 	"go.uber.org/zap"
@@ -22,6 +23,114 @@ type stubTX struct {
 
 func (s stubTX) Request(context.Context, *pb.Envelope) (*pb.Envelope, error) {
 	return s.env, s.err
+}
+
+// stubTXAssignID gán transaction_id vào request (như Service.Request thật) rồi trả lỗi.
+type stubTXAssignID struct {
+	id  uint64
+	err error
+}
+
+func (s stubTXAssignID) Request(_ context.Context, req *pb.Envelope) (*pb.Envelope, error) {
+	if req != nil {
+		req.TransactionId = s.id
+	}
+	return nil, s.err
+}
+
+func TestDataErrorReturnsTransactionID(t *testing.T) {
+	t.Parallel()
+	srv, err := New(Config{NodeID: 1, Listen: "127.0.0.1", Port: 0}, stubTXAssignID{
+		id:  99,
+		err: transaction.ErrTransactionTimeout,
+	}, zap.NewNop(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	addr := waitAddr(t, srv)
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/data", bytes.NewReader([]byte("payload")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Message-Id", "1001")
+	got, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = got.Body.Close()
+	if got.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d", got.StatusCode)
+	}
+	if got.Header.Get("X-Transaction-Id") != "99" {
+		t.Fatalf("tx header = %q want 99", got.Header.Get("X-Transaction-Id"))
+	}
+}
+
+func TestDataLogicErrorMapsHTTPStatus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		code   pb.ErrorCode
+		want   int
+	}{
+		{name: "invalid", code: pb.ErrorCode_ERROR_CODE_INVALID_MESSAGE, want: http.StatusBadRequest},
+		{name: "overload", code: pb.ErrorCode_ERROR_CODE_OVERLOAD, want: http.StatusServiceUnavailable},
+		{name: "timeout", code: pb.ErrorCode_ERROR_CODE_TIMEOUT, want: http.StatusGatewayTimeout},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv, err := New(Config{NodeID: 1, Listen: "127.0.0.1", Port: 0}, stubTX{
+				err: &transaction.LogicError{Code: tc.code, Message: tc.name},
+			}, zap.NewNop(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			errCh := make(chan error, 1)
+			go func() { errCh <- srv.Serve() }()
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_ = srv.Shutdown(ctx)
+			})
+			addr := waitAddr(t, srv)
+			req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/v1/data", bytes.NewReader([]byte("x")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Message-Id", "1001")
+			got, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = got.Body.Close()
+			if got.StatusCode != tc.want {
+				t.Fatalf("status = %d want %d", got.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+func waitAddr(t *testing.T, srv *Server) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if addr := srv.Addr(); addr != "" {
+			return addr
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("server did not listen")
+	return ""
 }
 
 func TestHealthAndData(t *testing.T) {
