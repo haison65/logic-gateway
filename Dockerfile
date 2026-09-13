@@ -7,7 +7,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/http2gw ./cmd/http2gw \
  && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/logic ./cmd/logic \
- && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/master ./cmd/master
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/master ./cmd/master \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/client ./cmd/client
 
 FROM gcr.io/distroless/static-debian12:nonroot AS http2gw
 WORKDIR /
@@ -37,3 +38,10 @@ USER nonroot:nonroot
 EXPOSE 9200/tcp
 ENTRYPOINT ["/master"]
 CMD ["-config", "/configs/master.yaml"]
+
+FROM gcr.io/distroless/static-debian12:nonroot AS client
+WORKDIR /
+COPY --from=build --chown=nonroot:nonroot /out/client /client
+USER nonroot:nonroot
+ENTRYPOINT ["/client"]
+CMD ["-config", "/configs/client.yaml"]

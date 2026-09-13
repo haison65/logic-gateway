@@ -1,4 +1,4 @@
-# Start local topology (headless, PID-tracked): master + http2gw + logic-1 + logic-2
+# Start local topology (headless, PID-tracked): master + http2gw + logic-1 + logic-2 + logic-3
 #   .\scripts\start_local.ps1
 # Window mode (debug): .\scripts\start_local_p0.ps1
 
@@ -9,7 +9,7 @@ Ensure-RunDir
 
 $existing = Read-Pids
 if ($existing.Count -gt 0) {
-    Write-Host "PID file exists — stop first: .\scripts\stop_local.ps1" -ForegroundColor Yellow
+    Write-Host "PID file exists - stop first: .\scripts\stop_local.ps1" -ForegroundColor Yellow
 }
 
 $map = @{}
@@ -43,5 +43,5 @@ if (-not $okMaster -or -not $okGw) {
 Write-Host "Topology UP." -ForegroundColor Green
 Write-Host "  Master nodes: curl.exe -s http://127.0.0.1:9200/v1/nodes"
 Write-Host "  Status:       .\scripts\status_local.ps1"
-Write-Host "  Load:         .\scripts\load_local.ps1"
+Write-Host "  Load:         .\scripts\start.ps1"
 Write-Host "  Stop:         .\scripts\stop_local.ps1"

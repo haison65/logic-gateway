@@ -8,7 +8,7 @@ Set-Location $script:RepoRoot
 Write-Host "=== PIDs ===" -ForegroundColor Cyan
 $map = Read-Pids
 if ($map.Count -eq 0) {
-    Write-Host "(no scripts/run/pids.json — maybe start_local_p0 window mode)"
+    Write-Host "(no scripts/run/pids.json - maybe start_local_p0 window mode)"
 } else {
     foreach ($name in $map.Keys) {
         $procId = [int]$map[$name].Pid

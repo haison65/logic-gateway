@@ -1,5 +1,5 @@
-# Scrape http2gw Prometheus exposition (/metrics).
-# Dùng với docker-compose (target DNS: http2gw) hoặc scrape host khi chạy go run.
+# Scrape http2gw + Logic Prometheus exposition (/metrics).
+# Dùng với docker-compose (target DNS) hoặc scrape host khi chạy go run.
 
 global:
   scrape_interval: 5s
@@ -21,3 +21,22 @@ scrape_configs:
       - targets: ["host.docker.internal:8080"]
         labels:
           env: host
+
+  # Logic ×3 (docker-compose.local.yml) — mỗi container :9190/metrics
+  - job_name: logic
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "logic-1:9190"
+          - "logic-2:9190"
+          - "logic-3:9190"
+        labels:
+          env: compose
+
+  # Logic đơn (docker-compose.yml)
+  - job_name: logic-single
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["logic:9190"]
+        labels:
+          env: compose

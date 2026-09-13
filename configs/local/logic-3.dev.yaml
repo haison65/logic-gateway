@@ -1,17 +1,18 @@
+# Logic-3 — UDP 9102, node_id=4.
 node:
-  node_id: 2
-  instance_id: logic-1
-  name: logic-1
+  node_id: 4
+  instance_id: logic-3-local
+  name: logic-3
   type: logic
   group: local-server
-  ip: logic-1
+  ip: 127.0.0.1
 
 udp:
-  listen: 0.0.0.0
-  port: 9100
+  listen: 127.0.0.1
+  port: 9102
 
 gateway:
-  host: http2gw
+  host: 127.0.0.1
   port: 9000
 
 services:
@@ -27,8 +28,4 @@ resource:
   cpu_cores: 2
   memory: 2G
 
-master_url: http://master:9200
-
-metrics:
-  listen: 0.0.0.0
-  port: 9190
+master_url: http://127.0.0.1:9200
