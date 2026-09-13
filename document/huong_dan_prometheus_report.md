@@ -1,260 +1,180 @@
-# Hướng dẫn test + thu thập Prometheus cho report
+# Prometheus — test và report
 
-Ngày: 2026-08-27  
-Mục tiêu: chạy tải có kiểm soát, scrape Prometheus, lấy số liệu viết báo cáo hiệu năng / ổn định.
-
----
-
-## 1. Metrics đã có
-
-| Endpoint | Format | Dùng khi |
-|----------|--------|----------|
-| `GET /metrics` | Prometheus / OpenMetrics | Scrape bằng Prometheus, PromQL, Grafana |
-| `GET /metrics.json` | JSON snapshot | Kiểm tra nhanh bằng curl / script |
-
-### Metric ứng dụng (prefix `http2gw_`)
-
-| Metric | Loại | Ý nghĩa cho report |
-|--------|------|--------------------|
-| `http2gw_http_requests_total{status,result}` | Counter | Tổng request; tách OK/fail và HTTP status |
-| `http2gw_http_requests_fail_total{status,reason}` | Counter | Fail theo reason (`timeout`, `no_routing_target`, …) |
-| `http2gw_http_requests_in_flight` | Gauge | Concurrent đang xử lý |
-| `http2gw_http_request_duration_seconds` | Histogram | Latency → rate, p50/p95/p99 |
-| `http2gw_logic_registered_total` | Counter | Logic REGISTER accepted |
-| `http2gw_heartbeat_success_total` | Counter | HB Logic→GW OK |
-| `http2gw_heartbeat_timeout_total` | Counter | Monitor timeout (SUSPECT/DEAD) |
-| `http2gw_udp_rx_total` / `http2gw_udp_tx_total` | Counter | UDP vào/ra dispatcher |
-| `http2gw_route_failed_total` | Counter | Không route được Logic |
-| `http2gw_transaction_timeout_total` | Counter | Chờ DATA_RESPONSE quá hạn |
-| `go_*` / `process_*` | runtime | Goroutine, GC, RSS (bối cảnh hệ thống) |
+SoT metrics: `internal/metrics`, `internal/logicnode/metrics.go`, `deploy/prometheus/prometheus.yml`.
 
 ---
 
-## 2. Chuẩn bị môi trường
+## 1. Endpoints
 
-### Cách A0 — P0 Local: 1 HTTP2GW + 2 Logic (`go run` + script)
+| URL | Format |
+|-----|--------|
+| `http://<gw>:8080/metrics` | Prometheus (`http2gw_*`) |
+| `http://<gw>:8080/metrics.json` | JSON snapshot |
+| `http://<logic>:9190/metrics` | Prometheus (`logic_*`) — khi bật `metrics.port` |
 
-Topology lab Local (không cần K8s):
+Host Docker local: Logic metrics `9191` / `9192` / `9193`.
 
-| Role | Số | Cách chạy |
-|------|---:|-----------|
-| HTTP2GW | 1 | `configs/http2gw.dev.yaml` — `:8080` / UDP `:9000` |
-| Logic | 2 | `logic-1.dev.yaml` (`node_id=2`, UDP `9100`) + `logic-2.dev.yaml` (`node_id=3`, UDP `9101`) |
-| Http2 client | 2 | process `cmd/client` (script) |
-| Performance | 4 | process `cmd/client` (script) |
+---
+
+## 2. Tên metric (code)
+
+### GW — namespace `http2gw`
+
+| Metric | Labels | Ý nghĩa |
+|--------|--------|---------|
+| `http2gw_http_requests_total` | `status`, `result` | Tổng request |
+| `http2gw_http_requests_fail_total` | `status`, `reason` | Fail theo reason |
+| `http2gw_http_requests_in_flight` | | Concurrent |
+| `http2gw_http_request_duration_seconds` | | Latency histogram |
+| `http2gw_logic_routed_total` | `node_id`, `node` | Route+Send OK theo Logic |
+| `http2gw_logic_registered_total` | | REGISTER accepted |
+| `http2gw_heartbeat_success_total` | | HB OK |
+| `http2gw_heartbeat_timeout_total` | | Monitor timeout |
+| `http2gw_udp_rx_total` / `http2gw_udp_tx_total` | | UDP dispatcher |
+| `http2gw_route_failed_total` | | Không route |
+| `http2gw_transaction_timeout_total` | | Wait quá hạn → 504 |
+| `http2gw_logic_nodes` | `state` | Số node theo state |
+| `http2gw_failover_retry_total` | | Retry sau Send failure hoặc transaction timeout |
+
++ `go_*`, `process_*`.
+
+### Logic — namespace `logic`
+
+| Metric | Labels | Ý nghĩa |
+|--------|--------|---------|
+| `logic_requests_total` | `node`, `node_id` (const) | DATA_REQUEST nhận được |
+| `logic_register_status` | `node`, `node_id` | `1` = REGISTER accepted |
+| `logic_heartbeat_rtt_seconds` | `node`, `node_id` | RTT heartbeat gần nhất |
+| `logic_queue_size` | `node`, `node_id` | In-flight DATA |
+| `logic_udp_data_request_rx_total` | `node`, `node_id` | DATA_REQUEST đọc từ UDP |
+| `logic_udp_data_response_tx_total` | `node`, `node_id` | DATA/ERROR gửi về GW |
+| `logic_processing_duration_seconds` | `node`, `node_id` | Latency xử lý trong worker |
+
+---
+
+## 3. Scrape jobs (`deploy/prometheus/prometheus.yml`)
+
+| Job | Target |
+|-----|--------|
+| `http2gw` | `http2gw:8080` |
+| `http2gw-host` | `host.docker.internal:8080` |
+| `logic` | `logic-1:9190`, `logic-2:9190`, `logic-3:9190` |
+| `logic-single` | `logic:9190` |
+
+Interval: **5s**. Retention Compose: **7d**.
+
+---
+
+## 4. Chạy môi trường đo
+
+### Docker local (đủ 3 Logic)
 
 ```powershell
-# Mo 3 cua so: http2gw, logic-1, logic-2
-.\scripts\start_local_p0.ps1
+docker compose -f docker-compose.local.yml up -d --build
+# UI http://127.0.0.1:9090 — Targets: http2gw + logic UP
 
-# Smoke (sau khi ca hai Logic log "logic da dang ky")
-curl.exe -s http://127.0.0.1:8080/healthz
-go run ./cmd/client -n 1 -unique-session -body hello
-
-# Day tai: 2 client + 4 performance (mac dinh 30s)
-.\scripts\load_local_p0.ps1
-.\scripts\load_local_p0.ps1 -Duration 60s -ClientQPS 20 -PerfQPS 50
+.\scripts\start.ps1 -Duration 60s
 ```
 
-Log client: `scripts/load-logs/`. Dùng `-unique-session` để `consistent_hash` trải 2 Logic.
-
-Prometheus (tuỳ chọn): `docker compose up -d prometheus` → UI `:9090`, target `http2gw-host` UP.
-
-### Cách A — Local 1 Logic (`go run`) + Prometheus Docker
-
-Terminal 1–2:
-
-```powershell
-go run ./cmd/http2gw -config configs/http2gw.dev.yaml
-go run ./cmd/logic   -config configs/logic.dev.yaml
-```
-
-Terminal 3 — chỉ Prometheus (không build lại app):
-
-```powershell
-docker compose up -d prometheus
-```
-
-Prometheus UI: http://127.0.0.1:9090  
-Job `http2gw-host` scrape `host.docker.internal:8080`.
-
-Kiểm tra target: **Status → Targets** — `http2gw-host` phải **UP**.
-
-### Cách B — Full Compose (http2gw + logic + prometheus)
+### Compose tối thiểu
 
 ```powershell
 docker compose up -d --build
 ```
 
-- HTTP gateway: http://127.0.0.1:8080  
-- Prometheus: http://127.0.0.1:9090  
-- Job `http2gw` scrape `http2gw:8080` trong mạng Compose.
-
-Client vẫn chạy **trên host** (h2c):
+### go run + Prometheus
 
 ```powershell
-go run ./cmd/client -addr http://127.0.0.1:8080 -n 1 -body hello
+go run ./cmd/http2gw -config configs/http2gw.dev.yaml
+go run ./cmd/logic -config configs/logic.dev.yaml
+docker compose up -d prometheus
 ```
+
+Dùng job `http2gw-host`. Logic dev YAML mặc định **không** bật `metrics.port`.
 
 ---
 
-## 3. Smoke test (trước khi đo tải)
+## 5. Smoke
 
 ```powershell
-# Health
 curl.exe -s http://127.0.0.1:8080/healthz
-
-# Một request thành công
 go run ./cmd/client -n 1 -message-id 1001 -body hello
-
-# Prometheus text (phải thấy http2gw_*)
-curl.exe -s http://127.0.0.1:8080/metrics | findstr http2gw_
-
-# JSON (tuỳ chọn)
-curl.exe -s http://127.0.0.1:8080/metrics.json
+curl.exe -s http://127.0.0.1:8080/metrics | findstr "http2gw_logic_routed http2gw_http_requests"
+curl.exe -s http://127.0.0.1:9191/metrics | findstr logic_requests
 ```
 
-Ghi vào report: thời điểm bắt đầu, phiên bản commit (`git rev-parse --short HEAD`), máy (CPU/RAM), OS.
+Ghi report: `git rev-parse --short HEAD`, tham số `load.request.yaml`, máy/VM.
 
 ---
 
-## 4. Kịch bản test đề xuất (để viết report)
+## 6. Kịch bản gợi ý
 
-Chạy lần lượt; **ghi lại** lệnh, thời gian bắt đầu/kết thúc, output client.
+| # | Cách | Mục đích |
+|---|------|----------|
+| T1 | `go run ./cmd/client -n 100 -c 1` | Baseline |
+| T2 | `-n 2000 -c 20` | Concurrent |
+| T3 | `-d 60s -c 20 -qps 100` | Sustained |
+| T4 | `.\scripts\start.ps1 -Duration 1m` | Docker multi-client |
+| T5 | PromQL by `node` sau T4 | Cân bằng router |
+| T6 | Stop 1 Logic / thiếu message-id | 503 / 400 |
 
-| # | Tên | Lệnh gợi ý | Mục đích |
-|---|-----|------------|----------|
-| T1 | Baseline | `-n 100 -c 1` | Latency đơn luồng, không queue |
-| T2 | Concurrent | `-n 2000 -c 20` | Throughput + p95 dưới tải vừa |
-| T3 | Sustained | `-d 60s -c 20 -qps 100` | Ổn định 60s, RPS cố định |
-| T4 | Stress | `-d 30s -c 50 -qps 500` | Đẩy cao; quan sát timeout / fail |
-| T5 | Fail path | Client **không** `-message-id` hoặc dừng Logic | `fail_total`, `route_failed` |
+Artefacts T4: `scripts/run-logs/*_aggregate.json`, `scripts/fail-logs/*.jsonl`.
 
-Ví dụ T3:
-
-```powershell
-go run ./cmd/client -d 60s -c 20 -qps 100 -message-id 1001 -body hello
-```
-
-Sau mỗi kịch bản, copy block stdout client (ok/fail/rps/latency p50/p95/p99) vào report.
+**Lưu ý timeout:** GW `transaction.timeout=5s` → 504; client `timeout=10s` là lớp khác.
 
 ---
 
-## 5. PromQL — số liệu chụp cho report
-
-Trong Prometheus UI → Graph (hoặc API). Đặt **time range** khớp cửa sổ test.
-
-### Throughput (req/s)
+## 7. PromQL
 
 ```promql
 sum(rate(http2gw_http_requests_total[1m]))
-```
 
-### Error rate (%)
-
-```promql
 100 * sum(rate(http2gw_http_requests_total{result="fail"}[1m]))
-  / sum(rate(http2gw_http_requests_total[1m]))
-```
+  / clamp_min(sum(rate(http2gw_http_requests_total[1m])), 1e-9)
 
-### Latency p50 / p95 / p99 (giây)
-
-```promql
-histogram_quantile(0.50, sum(rate(http2gw_http_request_duration_seconds_bucket[1m])) by (le))
 histogram_quantile(0.95, sum(rate(http2gw_http_request_duration_seconds_bucket[1m])) by (le))
-histogram_quantile(0.99, sum(rate(http2gw_http_request_duration_seconds_bucket[1m])) by (le))
-```
 
-### Fail theo reason
+sum by (node) (increase(http2gw_logic_routed_total[5m]))
+sum by (node) (increase(logic_requests_total[5m]))
 
-```promql
-sum by (reason) (increase(http2gw_http_requests_fail_total[5m]))
-```
-
-### Timeout / route fail trong cửa sổ test
-
-```promql
 increase(http2gw_transaction_timeout_total[5m])
-increase(http2gw_route_failed_total[5m])
-```
+sum by (reason) (increase(http2gw_http_requests_fail_total[5m]))
 
-### Heartbeat & REGISTER
-
-```promql
-increase(http2gw_logic_registered_total[1h])
-rate(http2gw_heartbeat_success_total[1m])
-increase(http2gw_heartbeat_timeout_total[5m])
-```
-
-### In-flight & runtime
-
-```promql
 http2gw_http_requests_in_flight
 go_goroutines
-process_resident_memory_bytes
 ```
 
-### Export số liệu qua API (PowerShell)
-
-Thay `QUERY` và khoảng thời gian:
-
 ```powershell
-$q = [uri]::EscapeDataString('sum(rate(http2gw_http_requests_total[1m]))')
+$q = [uri]::EscapeDataString('sum by (node) (increase(http2gw_logic_routed_total[5m]))')
 curl.exe -s "http://127.0.0.1:9090/api/v1/query?query=$q"
 ```
 
-Instant query tại một thời điểm; cho time series:
+---
+
+## 8. Checklist report
+
+1. Môi trường + commit + Compose file  
+2. Topology (GW CPU, số Logic, `client_count`×`concurrency`, body_size)  
+3. Hai timeout (client vs transaction)  
+4. Client aggregate (ok/fail/rps/latency)  
+5. Prometheus: RPS, error %, p95, **phân bố node**  
+6. `transaction_timeout`, `docker stats`  
+7. Nhận xét bão hòa (p95 ≈ 5s + 504)  
+8. Phụ lục Targets + mẫu metrics  
+
+---
+
+## 9. Test unit metrics
 
 ```powershell
-$q = [uri]::EscapeDataString('histogram_quantile(0.95, sum(rate(http2gw_http_request_duration_seconds_bucket[1m])) by (le))')
-$start = [DateTimeOffset]::UtcNow.AddMinutes(-5).ToUnixTimeSeconds()
-$end   = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-curl.exe -s "http://127.0.0.1:9090/api/v1/query_range?query=$q&start=$start&end=$end&step=5"
+go test ./internal/metrics ./internal/httpsrv ./internal/logicnode -count=1
 ```
 
-Lưu JSON response vào thư mục report (ví dụ `report/raw/t3_p95.json`).
-
 ---
 
-## 6. Checklist nội dung report
-
-1. **Môi trường:** OS, CPU, RAM, cách chạy (local / Compose), commit hash.  
-2. **Topology:** http2gw `:8080` + Logic UDP + client h2c.  
-3. **Kịch bản:** bảng T1–T5 + tham số `-n/-c/-d/-qps`.  
-4. **Kết quả client:** ok, fail, rps, latency min/avg/p50/p95/p99/max.  
-5. **Kết quả Prometheus:** throughput, error %, p50/p95/p99, fail-by-reason.  
-6. **Ổn định:** `heartbeat_timeout`, `transaction_timeout`, `route_failed`, goroutine/RSS.  
-7. **Nhận xét:** điểm bão hòa (khi nào p99/fail tăng), giới hạn (1 Logic echo, không DB).  
-8. **Phụ lục:** lệnh đầy đủ, screenshot Targets UP, mẫu `/metrics` hoặc JSON.
-
----
-
-## 7. Unit / integration test (CI local)
+## 10. Dọn
 
 ```powershell
-go test ./...
-go test ./internal/metrics ./internal/httpsrv -count=1
-```
-
-Không thay thế load test; chỉ xác nhận dual-write metrics + handler `/metrics` / `/metrics.json`.
-
----
-
-## 8. Dừng / dọn
-
-```powershell
-docker compose down
-# giữ volume Prometheus:
-# docker compose down   (volume prometheus_data vẫn còn)
-# xóa luôn dữ liệu scrape:
+docker compose -f docker-compose.local.yml down
 docker compose down -v
 ```
-
----
-
-## 9. Ghi chú
-
-- Scrape Prometheus dùng HTTP/1.1 tới cùng cổng h2c — bình thường.  
-- `http2gw` job trong Compose có thể **DOWN** nếu bạn chỉ chạy `go run` (dùng job `http2gw-host`).  
-- Retention mặc định Compose: **7 ngày** (`--storage.tsdb.retention.time=7d`).  
-- Client stats và Prometheus histogram có thể lệch nhẹ (cửa sổ rate, đồng hồ) — report nên nêu cả hai nguồn.
