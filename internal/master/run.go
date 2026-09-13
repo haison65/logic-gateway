@@ -207,9 +207,17 @@ func (s *httpServer) handleListNodes(w http.ResponseWriter, _ *http.Request) {
 	for _, n := range list {
 		out = append(out, controlplane.ToView(n))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"count": len(out),
-		"nodes": out,
+	type view struct {
+		Level string                  `json:"level"`
+		Msg   string                  `json:"msg"`
+		Count int                     `json:"count"`
+		Nodes []controlplane.NodeView `json:"nodes"`
+	}
+	writeJSONPretty(w, http.StatusOK, view{
+		Level: "info",
+		Msg:   "nodes_inventory",
+		Count: len(out),
+		Nodes: out,
 	})
 }
 
@@ -312,7 +320,15 @@ func (s *httpServer) handleLeave(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONPretty(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
 }
