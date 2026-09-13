@@ -9,6 +9,7 @@ gateway:
 node:
   node_id: 2
   instance_id: logic-docker
+  name: logic
   ip: logic
 
 services:
@@ -19,3 +20,7 @@ services:
 heartbeat:
   interval: 1000ms
   timeout: 3000ms
+
+metrics:
+  listen: 0.0.0.0
+  port: 9190

@@ -9,10 +9,24 @@ node:
 http:
   listen: 0.0.0.0
   port: 8080
+  # Outbound §12 (Logic → GW DATA_REQUEST → HTTP/2 remote). Rỗng = tắt.
+  # Ví dụ: remote: "http://remote-app:8080"
+  remote: ""
+  # Admission ~10k TPS @ 1 CPU (Allow → 429, không xếp hàng).
+  max_rps: 10000
+  max_rps_burst: 2000
+  # Chặn sóng 504: reject khi pending waiter quá cao (Little’s ≈ 10k×30ms≈300; headroom 600).
+  max_pending: 600
+  # CPU/heap profile: go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30
+  pprof_listen: "0.0.0.0:6060"
 
 udp:
   listen: 0.0.0.0
   port: 9000
+  # Bounded queue: UDP Receive → workers (không block ReadFromUDP khi Complete chậm).
+  inbound_queue_size: 16384
+  # Iter #19: 1 CPU / GOMAXPROCS=1 — 1 worker giảm schedule/select contention (trước 2).
+  inbound_workers: 1
 
 heartbeat:
   interval: 1000ms
@@ -31,7 +45,7 @@ services:
     message_types: [1001, 1002, 1003]
 
 resource:
-  cpu_cores: 4
-  memory: 8G
+  cpu_cores: 1
+  memory: 2G
 
 master_url: http://master:9200

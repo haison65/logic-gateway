@@ -7,7 +7,7 @@ Set-Location $script:RepoRoot
 
 $map = Read-Pids
 if ($map.Count -eq 0) {
-    Write-Host "No pids.json — nothing to stop (or use kill by name)." -ForegroundColor Yellow
+    Write-Host "No pids.json - nothing to stop (or use kill by name)." -ForegroundColor Yellow
     exit 0
 }
 

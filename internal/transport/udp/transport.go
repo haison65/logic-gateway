@@ -22,6 +22,13 @@ import (
 // giảm qua Config.MaxPacketSize. Phân mảnh/ghép mảnh không thuộc Phase 3.
 const DefaultMaxPacketSize = 65507
 
+// DefaultSocketBufferSize là SO_RCVBUF/SO_SNDBUF mặc định khi caller bật buffer (F3).
+// 32 MiB: giảm Case B drop RESP dưới tải 4KB @ 1 CPU (kernel queue).
+const DefaultSocketBufferSize = 32 << 20 // 32 MiB
+
+// DefaultReceiveBatchSize là số datagram tối đa mỗi ReadBatch / drain (recvmmsg).
+const DefaultReceiveBatchSize = 64
+
 // DefaultReadPollInterval là chu kỳ Receive đang chặn kiểm tra ctx.Done().
 const DefaultReadPollInterval = 50 * time.Millisecond
 
@@ -45,6 +52,16 @@ type Config struct {
 	// ReadPollInterval dùng khi chờ datagram để Receive nhận biết hủy context.
 	// 0 dùng DefaultReadPollInterval.
 	ReadPollInterval time.Duration
+	// ReadBufferSize SO_RCVBUF (byte). 0 = giữ mặc định OS.
+	ReadBufferSize int
+	// WriteBufferSize SO_SNDBUF (byte). 0 = giữ mặc định OS.
+	WriteBufferSize int
+	// SendBatchSize: >0 bật gom Send đồng thời (P1.1). 0 = Send sync từng packet.
+	SendBatchSize int
+	// SendBatchWait: cửa sổ gom batch. 0 = 100µs.
+	SendBatchWait time.Duration
+	// ReceiveBatchSize: >0 bật ReceiveRawBatch (Linux recvmmsg). 0 = DefaultReceiveBatchSize khi gọi batch.
+	ReceiveBatchSize int
 }
 
 // Conn là triển khai UDP cụ thể.
@@ -54,12 +71,20 @@ type Config struct {
 //
 // Đồng thời:
 //   - Send an toàn khi nhiều goroutine gọi cùng lúc.
-//   - Receive dành cho một goroutine tiêu thụ.
+//   - Receive / ReceiveRaw / ReceiveRawBatch dành cho một goroutine tiêu thụ.
 //   - Close có thể gọi đồng thời với Send/Receive.
 type Conn struct {
 	conn             *net.UDPConn
 	maxPacketSize    int
 	readPollInterval time.Duration
+	receiveBatchSize int
+	// readBuf tái sử dụng trên receive goroutine duy nhất (không share với Send).
+	readBuf []byte
+	// readBatchBufs scratch cho ReceiveRawBatch (cùng receive goroutine).
+	readBatchBufs [][]byte
+	bufReport     BufferApplyReport
+
+	batcher *sendBatcher
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -81,6 +106,18 @@ func New(cfg Config) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen UDP: %w", err)
 	}
+	if cfg.ReadBufferSize > 0 {
+		if err := conn.SetReadBuffer(cfg.ReadBufferSize); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("set UDP read buffer: %w", err)
+		}
+	}
+	if cfg.WriteBufferSize > 0 {
+		if err := conn.SetWriteBuffer(cfg.WriteBufferSize); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("set UDP write buffer: %w", err)
+		}
+	}
 
 	maxSize := cfg.MaxPacketSize
 	if maxSize <= 0 {
@@ -91,17 +128,109 @@ func New(cfg Config) (*Conn, error) {
 	if poll <= 0 {
 		poll = DefaultReadPollInterval
 	}
+	recvBatch := cfg.ReceiveBatchSize
+	if recvBatch <= 0 {
+		recvBatch = DefaultReceiveBatchSize
+	}
 
-	return &Conn{
+	c := &Conn{
 		conn:             conn,
 		maxPacketSize:    maxSize,
 		readPollInterval: poll,
+		receiveBatchSize: recvBatch,
+		readBuf:          make([]byte, maxSize),
 		closed:           make(chan struct{}),
-	}, nil
+	}
+	c.bufReport = c.applySocketBuffers(cfg.ReadBufferSize, cfg.WriteBufferSize)
+	if cfg.SendBatchSize > 0 {
+		c.batcher = startSendBatcher(c, cfg.SendBatchSize, cfg.SendBatchWait)
+	}
+	return c, nil
 }
+
+// BufferApplyReport mô tả configured vs actual SO_RCVBUF/SNDBUF (benchmark phải nhìn actual).
+type BufferApplyReport struct {
+	ConfiguredRcvbuf       int
+	RequestedRcvbuf        int
+	ActualRcvbufBeforeForce int
+	ForceError             error
+	ActualRcvbufAfterForce int
+	ConfiguredSndbuf       int
+	RequestedSndbuf        int
+	ActualSndbufBeforeForce int
+	ActualSndbufAfterForce int
+	Forced                 bool
+}
+
+// BufferApplyReport trả về kết quả apply buffer lần New (zero nếu không set buffer).
+func (c *Conn) BufferApplyReport() BufferApplyReport {
+	if c == nil {
+		return BufferApplyReport{}
+	}
+	return c.bufReport
+}
+
+// applySocketBuffers: Set*Buffer rồi FORCE nếu bị clamp. Không nuốt force_error (ghi vào report).
+func (c *Conn) applySocketBuffers(wantR, wantW int) BufferApplyReport {
+	rep := BufferApplyReport{
+		ConfiguredRcvbuf: wantR,
+		RequestedRcvbuf:  wantR,
+		ConfiguredSndbuf: wantW,
+		RequestedSndbuf:  wantW,
+	}
+	if c == nil || (wantR <= 0 && wantW <= 0) {
+		return rep
+	}
+	beforeR, beforeW, err := c.SocketBufferSizes()
+	if err != nil {
+		rep.ForceError = fmt.Errorf("getsockopt before force: %w", err)
+		// Vẫn thử FORCE.
+		if ferr := c.forceSocketBuffers(wantR, wantW); ferr != nil {
+			rep.ForceError = fmt.Errorf("%v; force: %w", rep.ForceError, ferr)
+		} else {
+			rep.Forced = true
+		}
+	} else {
+		rep.ActualRcvbufBeforeForce = beforeR
+		rep.ActualSndbufBeforeForce = beforeW
+		needForce := (wantR > 0 && beforeR > 0 && beforeR < wantR) ||
+			(wantW > 0 && beforeW > 0 && beforeW < wantW) ||
+			(wantR > 0 && beforeR == 0) || (wantW > 0 && beforeW == 0)
+		if needForce {
+			rep.Forced = true
+			if ferr := c.forceSocketBuffers(wantR, wantW); ferr != nil {
+				rep.ForceError = ferr
+			}
+		}
+	}
+	afterR, afterW, aerr := c.SocketBufferSizes()
+	if aerr != nil {
+		if rep.ForceError == nil {
+			rep.ForceError = fmt.Errorf("getsockopt after force: %w", aerr)
+		} else {
+			rep.ForceError = fmt.Errorf("%v; after: %w", rep.ForceError, aerr)
+		}
+		return rep
+	}
+	rep.ActualRcvbufAfterForce = afterR
+	rep.ActualSndbufAfterForce = afterW
+	return rep
+}
+
+// Đảm bảo Conn triển khai RawReceiver / RawBatchReceiver (decode off receive path).
+var _ RawReceiver = (*Conn)(nil)
+var _ RawBatchReceiver = (*Conn)(nil)
 
 // Đảm bảo Conn triển khai Transport.
 var _ Transport = (*Conn)(nil)
+
+// ReceiveBatchSize trả về kích thước batch nhận đã cấu hình.
+func (c *Conn) ReceiveBatchSize() int {
+	if c == nil || c.receiveBatchSize <= 0 {
+		return DefaultReceiveBatchSize
+	}
+	return c.receiveBatchSize
+}
 
 // LocalAddr trả về địa chỉ UDP local mà socket đang bind.
 func (c *Conn) LocalAddr() net.Addr {
@@ -127,13 +256,19 @@ func (c *Conn) Send(ctx context.Context, msg *pb.Envelope, addr *net.UDPAddr) er
 		return fmt.Errorf("send UDP packet: nil destination address")
 	}
 
-	payload, err := encode(msg)
+	payload, release, err := encode(msg)
 	if err != nil {
 		return err
 	}
 	if len(payload) > c.maxPacketSize {
+		release()
 		return fmt.Errorf("%w: encoded size %d exceeds max %d", ErrPacketTooLarge, len(payload), c.maxPacketSize)
 	}
+
+	if c.batcher != nil {
+		return c.batcher.submit(ctx, payload, release, addr)
+	}
+	defer release()
 
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = c.conn.SetWriteDeadline(deadline)
@@ -156,15 +291,12 @@ func (c *Conn) Send(ctx context.Context, msg *pb.Envelope, addr *net.UDPAddr) er
 	return nil
 }
 
-// Receive đọc một datagram UDP, giải mã thành Envelope, và trả về địa chỉ người gửi.
-// Gói lỗi định dạng trả về ErrInvalidMessage mà không đóng transport.
-// Hủy ctx hoặc Close Conn để gỡ chặn Receive đang chờ.
-func (c *Conn) Receive(ctx context.Context) (*pb.Envelope, *net.UDPAddr, error) {
+// ReceiveRaw đọc một datagram và trả về bản copy owned (pool). Caller phải ReleasePacket.
+// Không protobuf-decode — dùng cho dispatch receive loop (Case B).
+func (c *Conn) ReceiveRaw(ctx context.Context) ([]byte, *net.UDPAddr, error) {
 	if c == nil {
 		return nil, nil, ErrTransportClosed
 	}
-
-	buf := make([]byte, c.maxPacketSize)
 
 	for {
 		if err := c.checkOpen(ctx); err != nil {
@@ -182,7 +314,7 @@ func (c *Conn) Receive(ctx context.Context) (*pb.Envelope, *net.UDPAddr, error) 
 			return nil, nil, fmt.Errorf("set UDP read deadline: %w", err)
 		}
 
-		n, addr, err := c.conn.ReadFromUDP(buf)
+		n, addr, err := c.conn.ReadFromUDP(c.readBuf)
 		if err != nil {
 			if c.isClosed() {
 				return nil, nil, ErrTransportClosed
@@ -196,12 +328,26 @@ func (c *Conn) Receive(ctx context.Context) (*pb.Envelope, *net.UDPAddr, error) 
 			return nil, nil, fmt.Errorf("receive UDP packet: %w", err)
 		}
 
-		msg, err := decode(buf[:n])
-		if err != nil {
-			return nil, addr, err
-		}
-		return msg, addr, nil
+		pkt := acquirePacket(n)
+		copy(pkt, c.readBuf[:n])
+		return pkt, addr, nil
 	}
+}
+
+// Receive đọc một datagram UDP, giải mã thành Envelope, và trả về địa chỉ người gửi.
+// Gói lỗi định dạng trả về ErrInvalidMessage mà không đóng transport.
+// Hủy ctx hoặc Close Conn để gỡ chặn Receive đang chờ.
+func (c *Conn) Receive(ctx context.Context) (*pb.Envelope, *net.UDPAddr, error) {
+	pkt, addr, err := c.ReceiveRaw(ctx)
+	if err != nil {
+		return nil, addr, err
+	}
+	defer ReleasePacket(pkt)
+	msg, err := decode(pkt)
+	if err != nil {
+		return nil, addr, err
+	}
+	return msg, addr, nil
 }
 
 // Close đóng socket UDP và gỡ chặn các lời gọi Receive đang chờ.
@@ -213,6 +359,9 @@ func (c *Conn) Close() error {
 
 	var closeErr error
 	c.closeOnce.Do(func() {
+		if c.batcher != nil {
+			c.batcher.close()
+		}
 		close(c.closed)
 		if c.conn != nil {
 			closeErr = c.conn.Close()

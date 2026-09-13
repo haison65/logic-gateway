@@ -29,6 +29,12 @@ Thumbs.db
 .env
 .env.*
 
-# P0 load client logs
+# P0 load / fail / run summary artifacts
 scripts/load-logs/
+scripts/fail-logs/
+scripts/run-logs/
 scripts/run/
+
+# Local pprof profiles
+/*.pb
+/*.pb.gz

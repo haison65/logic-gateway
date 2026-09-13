@@ -42,7 +42,7 @@ func (s *runtimeStats) queueSize() int64 {
 }
 
 // Run lắng UDP, REGISTER với gateway, HEARTBEAT định kỳ, echo DATA_RESPONSE.
-// Receive chỉ chạy trên một goroutine.
+// Receive chạy một goroutine; DATA_REQUEST được xử lý song song qua worker pool.
 func Run(ctx context.Context, cfg config.Logic, log *zap.Logger) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -53,13 +53,34 @@ func Run(ctx context.Context, cfg config.Logic, log *zap.Logger) error {
 	log = logger.OrNop(log)
 
 	conn, err := udp.New(udp.Config{
-		ListenHost: cfg.UDP.Listen,
-		ListenPort: cfg.UDP.Port,
+		ListenHost:       cfg.UDP.Listen,
+		ListenPort:       cfg.UDP.Port,
+		ReadBufferSize:   udp.DefaultSocketBufferSize,
+		WriteBufferSize:  udp.DefaultSocketBufferSize,
+		SendBatchSize:    64,
+		SendBatchWait:    100 * time.Microsecond,
+		ReceiveBatchSize: udp.DefaultReceiveBatchSize,
 	})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	rep := conn.BufferApplyReport()
+	if rep.ConfiguredRcvbuf > 0 || rep.ActualRcvbufAfterForce > 0 {
+		fields := []zap.Field{
+			zap.Int("configured_rcvbuf", rep.ConfiguredRcvbuf),
+			zap.Int("requested_rcvbuf", rep.RequestedRcvbuf),
+			zap.Int("actual_rcvbuf_before_force", rep.ActualRcvbufBeforeForce),
+			zap.Int("actual_rcvbuf_after_force", rep.ActualRcvbufAfterForce),
+			zap.Bool("forced", rep.Forced),
+		}
+		if rep.ForceError != nil {
+			fields = append(fields, zap.Error(rep.ForceError), zap.String("force_error", rep.ForceError.Error()))
+			log.Warn("udp socket buffers", fields...)
+		} else {
+			log.Info("udp socket buffers", fields...)
+		}
+	}
 
 	gwAddr, err := netaddr.ResolveUDPAddr(ctx, cfg.Gateway.Host, cfg.Gateway.Port)
 	if err != nil {
@@ -88,10 +109,21 @@ func Run(ctx context.Context, cfg config.Logic, log *zap.Logger) error {
 	defer cancel()
 
 	rt := &runtimeStats{}
+	met := newNodeMetrics(cfg.Node.NodeID, cfg.Node.Name)
+	met.SetRegisterStatus(false)
+	met.SetQueueSize(0)
+	if err := startMetricsServer(runCtx, cfg.Metrics.Listen, cfg.Metrics.Port, met, log.Named("metrics")); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	workers := dataWorkerCount(cfg)
+	pool := newDataWorkerPool(workers, met, log.Named("pool"))
+	defer pool.Close()
+	log.Info("logic data worker pool", zap.Int("workers", workers), zap.Int("job_queue", defaultDataJobQueue))
 	regCh := make(chan *pb.RegisterResponse, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		err := receiveLoop(runCtx, conn, cfg.Node.NodeID, gwAddr, log, regCh, rt)
+		err := receiveLoop(runCtx, conn, cfg.Node.NodeID, gwAddr, log, regCh, rt, met, pool)
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, udp.ErrTransportClosed) {
 			errCh <- err
 			cancel()
@@ -102,6 +134,7 @@ func Run(ctx context.Context, cfg config.Logic, log *zap.Logger) error {
 		_ = conn.Close()
 		return err
 	}
+	met.SetRegisterStatus(true)
 
 	var seq atomic.Uint64
 	go heartbeatLoop(runCtx, conn, cfg, gwAddr, &seq, log, rt)
@@ -239,7 +272,7 @@ func sendHeartbeat(ctx context.Context, tr udp.Transport, nodeID uint32, gw *net
 	return tr.Send(ctx, env, gw)
 }
 
-func receiveLoop(ctx context.Context, tr udp.Transport, nodeID uint32, gw *net.UDPAddr, log *zap.Logger, regCh chan<- *pb.RegisterResponse, rt *runtimeStats) error {
+func receiveLoop(ctx context.Context, tr udp.Transport, nodeID uint32, gw *net.UDPAddr, log *zap.Logger, regCh chan<- *pb.RegisterResponse, rt *runtimeStats, met *nodeMetrics, pool *dataWorkerPool) error {
 	for {
 		env, from, err := tr.Receive(ctx)
 		if err != nil {
@@ -247,25 +280,39 @@ func receiveLoop(ctx context.Context, tr udp.Transport, nodeID uint32, gw *net.U
 				return err
 			}
 			if errors.Is(err, udp.ErrInvalidMessage) {
+				if met != nil {
+					met.AddUDPReceiveError()
+				}
 				log.Warn("udp envelope không hợp lệ", zap.Error(err))
 				continue
 			}
+			if met != nil {
+				met.AddUDPReceiveError()
+			}
 			return err
 		}
-		handleIncoming(ctx, tr, nodeID, gw, log, regCh, env, from, rt)
+		handleIncoming(ctx, tr, nodeID, gw, log, regCh, env, from, rt, met, pool)
 	}
 }
 
-func handleIncoming(ctx context.Context, tr udp.Transport, nodeID uint32, gw *net.UDPAddr, log *zap.Logger, regCh chan<- *pb.RegisterResponse, env *pb.Envelope, from *net.UDPAddr, rt *runtimeStats) {
+func handleIncoming(ctx context.Context, tr udp.Transport, nodeID uint32, gw *net.UDPAddr, log *zap.Logger, regCh chan<- *pb.RegisterResponse, env *pb.Envelope, from *net.UDPAddr, rt *runtimeStats, met *nodeMetrics, pool *dataWorkerPool) {
 	if env == nil {
 		return
 	}
 	switch env.GetType() {
 	case pb.MessageType_MESSAGE_TYPE_REGISTER_RESPONSE:
-		select {
-		case regCh <- env.GetRegisterResponse():
-		default:
+		if rr := env.GetRegisterResponse(); rr != nil {
+			cp := &pb.RegisterResponse{
+				Accepted:       rr.GetAccepted(),
+				AssignedNodeId: rr.GetAssignedNodeId(),
+				Message:        rr.GetMessage(),
+			}
+			select {
+			case regCh <- cp:
+			default:
+			}
 		}
+		udp.ReleaseEnvelope(env)
 	case pb.MessageType_MESSAGE_TYPE_HEARTBEAT_REQUEST:
 		// HTTP2GW → Logic heartbeat: trả HEARTBEAT_RESPONSE.
 		dest := from
@@ -286,50 +333,110 @@ func handleIncoming(ctx context.Context, tr udp.Transport, nodeID uint32, gw *ne
 			TimestampMs: uint64(ts),
 		}}
 		if err := tr.Send(ctx, out, dest); err != nil {
+			if met != nil {
+				met.AddUDPSendError()
+			}
 			log.Warn("gửi HEARTBEAT_RESPONSE thất bại", zap.Error(err), zap.String("to", addrString(dest)))
 		}
+		udp.ReleaseEnvelope(env)
 	case pb.MessageType_MESSAGE_TYPE_HEARTBEAT_RESPONSE:
 		if rt != nil {
 			sent := rt.hbSentAt.Load()
 			if sent > 0 {
+				rtt := time.Duration(time.Now().UnixNano() - sent)
 				rt.rttMu.Lock()
-				rt.heartbeatRTT = time.Duration(time.Now().UnixNano() - sent)
+				rt.heartbeatRTT = rtt
 				rt.rttMu.Unlock()
+				if met != nil {
+					met.SetHeartbeatRTT(rtt)
+				}
 			}
 		}
+		udp.ReleaseEnvelope(env)
 		return
 	case pb.MessageType_MESSAGE_TYPE_DATA_REQUEST:
+		// P0.2: enqueue không block receiveLoop; full → ERROR OVERLOAD (tránh GW Wait 5s).
 		dest := from
 		if dest == nil {
 			dest = gw
 		}
-		if rt != nil {
-			rt.inFlight.Add(1)
-			defer rt.inFlight.Add(-1)
+		if met != nil {
+			met.AddUDPDataRequestRX()
 		}
-		in := env.GetDataRequest()
-		var msgID uint32
-		var n int
-		if in != nil {
-			msgID = in.GetMessageId()
-			n = len(in.GetPayload())
+		envCapture := env
+		ok := pool.Enqueue(func() {
+			defer udp.ReleaseEnvelope(envCapture)
+			handleDataRequest(ctx, tr, nodeID, log, envCapture, dest, rt, met)
+		})
+		if !ok {
+			out := protocol.ErrorEnvelope(nodeID, env, pb.ErrorCode_ERROR_CODE_OVERLOAD, "logic data job queue full")
+			if err := tr.Send(ctx, out, dest); err != nil {
+				if met != nil {
+					met.AddUDPSendError()
+				}
+				log.Warn("gửi OVERLOAD thất bại", zap.Error(err), zap.Uint64("transaction_id", env.GetTransactionId()))
+				udp.ReleaseEnvelope(env)
+				return
+			}
+			if met != nil {
+				met.AddUDPDataResponseTX()
+			}
+			udp.ReleaseEnvelope(env)
 		}
-		log.Debug("udp data request",
-			zap.Uint64("transaction_id", env.GetTransactionId()),
-			zap.Uint32("message_id", msgID),
-			zap.Int("payload_bytes", n),
-			zap.String("from", addrString(from)),
-			zap.String("trace_id", env.GetTraceId()),
-		)
-		out := handleBusiness(nodeID, env, msgID)
-		if err := tr.Send(ctx, out, dest); err != nil {
-			log.Error("gửi DATA/ERROR thất bại", zap.Error(err), zap.Uint64("transaction_id", env.GetTransactionId()))
-			return
-		}
-		log.Debug("udp data out", zap.Uint64("transaction_id", env.GetTransactionId()), zap.Uint32("message_id", msgID), zap.String("type", out.GetType().String()), zap.String("to", addrString(dest)))
 	default:
 		log.Debug("bỏ qua loại envelope", zap.String("type", env.GetType().String()))
+		udp.ReleaseEnvelope(env)
 	}
+}
+
+func handleDataRequest(ctx context.Context, tr udp.Transport, nodeID uint32, log *zap.Logger, env *pb.Envelope, dest *net.UDPAddr, rt *runtimeStats, met *nodeMetrics) {
+	start := time.Now()
+	defer func() {
+		if met != nil {
+			met.ObserveProcessing(time.Since(start))
+		}
+	}()
+	if met != nil {
+		met.AddRequest()
+	}
+	if rt != nil {
+		rt.inFlight.Add(1)
+		if met != nil {
+			met.SetQueueSize(rt.queueSize())
+		}
+		defer func() {
+			rt.inFlight.Add(-1)
+			if met != nil {
+				met.SetQueueSize(rt.queueSize())
+			}
+		}()
+	}
+	in := env.GetDataRequest()
+	var msgID uint32
+	var n int
+	if in != nil {
+		msgID = in.GetMessageId()
+		n = len(in.GetPayload())
+	}
+	log.Debug("udp data request",
+		zap.Uint64("transaction_id", env.GetTransactionId()),
+		zap.Uint32("message_id", msgID),
+		zap.Int("payload_bytes", n),
+		zap.String("from", addrString(dest)),
+		zap.String("trace_id", env.GetTraceId()),
+	)
+	out := handleBusiness(nodeID, env, msgID)
+	if err := tr.Send(ctx, out, dest); err != nil {
+		if met != nil {
+			met.AddUDPSendError()
+		}
+		log.Error("gửi DATA/ERROR thất bại", zap.Error(err), zap.Uint64("transaction_id", env.GetTransactionId()))
+		return
+	}
+	if met != nil {
+		met.AddUDPDataResponseTX()
+	}
+	log.Debug("udp data out", zap.Uint64("transaction_id", env.GetTransactionId()), zap.Uint32("message_id", msgID), zap.String("type", out.GetType().String()), zap.String("to", addrString(dest)))
 }
 
 func handleBusiness(nodeID uint32, req *pb.Envelope, msgID uint32) *pb.Envelope {

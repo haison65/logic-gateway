@@ -11,13 +11,21 @@ import (
 
 // Logic là cấu hình process Logic.
 type Logic struct {
-	Node      Node      `yaml:"node"`
-	UDP       UDP       `yaml:"udp"`
-	Gateway   Gateway   `yaml:"gateway"`
-	Heartbeat Heartbeat `yaml:"heartbeat"`
-	Services  []Service `yaml:"services"`
-	Resource  Resource  `yaml:"resource"`
-	MasterURL string    `yaml:"master_url"`
+	Node      Node        `yaml:"node"`
+	UDP       UDP         `yaml:"udp"`
+	Gateway   Gateway     `yaml:"gateway"`
+	Heartbeat Heartbeat   `yaml:"heartbeat"`
+	Services  []Service   `yaml:"services"`
+	Resource  Resource    `yaml:"resource"`
+	MasterURL string      `yaml:"master_url"`
+	// Metrics: HTTP Prometheus (/metrics). Port 0 = tắt.
+	Metrics MetricsHTTP `yaml:"metrics"`
+}
+
+// MetricsHTTP là listen HTTP cho exposition Prometheus trên Logic.
+type MetricsHTTP struct {
+	Listen string `yaml:"listen"`
+	Port   int    `yaml:"port"`
 }
 
 type Gateway struct {
@@ -77,6 +85,9 @@ func (c *Logic) applyDefaults() {
 	if strings.TrimSpace(c.Node.Group) == "" {
 		c.Node.Group = "local-server"
 	}
+	if strings.TrimSpace(c.Metrics.Listen) == "" && c.Metrics.Port > 0 {
+		c.Metrics.Listen = "0.0.0.0"
+	}
 }
 
 // Validate kiểm tra cấu hình Logic.
@@ -114,6 +125,9 @@ func (c Logic) Validate() error {
 		if svc.ServiceID == 0 {
 			return fmt.Errorf("services[%d].service_id is required", i)
 		}
+	}
+	if c.Metrics.Port < 0 || c.Metrics.Port > 65535 {
+		return fmt.Errorf("metrics.port %d out of range", c.Metrics.Port)
 	}
 	return c.Resource.Validate("resource")
 }

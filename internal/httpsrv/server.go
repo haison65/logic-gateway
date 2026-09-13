@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -40,6 +39,12 @@ type Config struct {
 	TLSKey       string
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+	// MaxRPS: giới hạn admit POST /v1/data (0 = không giới hạn). Dùng Allow() — reject 429, không Wait.
+	MaxRPS float64
+	// MaxRPSBurst: burst token (0 = mặc định max(1, MaxRPS/10), clamp 2000).
+	MaxRPSBurst int
+	// MaxPending: reject 429 khi manager_pending vượt ngưỡng (0 = tắt).
+	MaxPending int
 }
 
 // Server phục vụ HTTP/2 (h2c hoặc TLS) và ánh xạ sang UDP DATA.
@@ -49,6 +54,7 @@ type Server struct {
 	log     *zap.Logger
 	metrics *metrics.Metrics
 	http    *http.Server
+	rps     *rpsGate
 
 	mu sync.Mutex
 	ln net.Listener
@@ -74,7 +80,7 @@ func New(cfg Config, tx Requester, log *zap.Logger, met *metrics.Metrics) (*Serv
 	if met == nil {
 		met = metrics.New()
 	}
-	s := &Server{cfg: cfg, tx: tx, log: log, metrics: met}
+	s := &Server{cfg: cfg, tx: tx, log: log, metrics: met, rps: newRPSGate(cfg.MaxRPS, cfg.MaxRPSBurst, met)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /health", s.handleHealth)
@@ -82,7 +88,10 @@ func New(cfg Config, tx Requester, log *zap.Logger, met *metrics.Metrics) (*Serv
 	mux.Handle("GET /metrics", met.Handler())
 	mux.HandleFunc("GET /metrics.json", s.handleMetricsJSON)
 	mux.HandleFunc("POST /v1/data", s.handleData)
-	h2s := &http2.Server{}
+	// F2: nới stream/conn (default http2 ~250) để khớp tải client cao.
+	h2s := &http2.Server{
+		MaxConcurrentStreams: 1024,
+	}
 	s.http = &http.Server{
 		Addr:              net.JoinHostPort(cfg.Listen, strconv.Itoa(cfg.Port)),
 		Handler:           h2c.NewHandler(mux, h2s),
@@ -118,7 +127,13 @@ func (s *Server) Serve() error {
 	s.mu.Lock()
 	s.ln = ln
 	s.mu.Unlock()
-	s.log.Info("http2gw đang lắng nghe HTTP", zap.String("addr", ln.Addr().String()), zap.Bool("tls", s.cfg.TLSCert != ""))
+	s.rps.start(context.Background())
+	s.log.Info("http2gw đang lắng nghe HTTP",
+		zap.String("addr", ln.Addr().String()),
+		zap.Bool("tls", s.cfg.TLSCert != ""),
+		zap.Float64("max_rps", s.cfg.MaxRPS),
+		zap.Int("max_rps_burst", s.cfg.MaxRPSBurst),
+	)
 	if s.cfg.TLSCert != "" {
 		return s.http.ServeTLS(ln, s.cfg.TLSCert, s.cfg.TLSKey)
 	}
@@ -130,6 +145,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s == nil || s.http == nil {
 		return nil
 	}
+	s.rps.close()
 	return s.http.Shutdown(ctx)
 }
 
@@ -144,12 +160,38 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleMetricsJSON(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.metrics.Snapshot())
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// Pretty JSON + envelope giống zap (level/msg) — dễ đọc khi curl.
+	type view struct {
+		Level string `json:"level"`
+		Msg   string `json:"msg"`
+		metrics.RequestStats
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(view{
+		Level:        "info",
+		Msg:          "metrics_snapshot",
+		RequestStats: s.metrics.Snapshot(),
+	})
 }
 
 func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	s.rps.observeArrival()
+	if !s.rps.allow() {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		s.metrics.Observe(time.Since(start), http.StatusTooManyRequests, metrics.ReasonRateLimited)
+		return
+	}
+	if s.cfg.MaxPending > 0 && s.metrics != nil {
+		if pend := s.metrics.GetManagerPending(); pend > int64(s.cfg.MaxPending) {
+			http.Error(w, "too many pending transactions", http.StatusTooManyRequests)
+			s.metrics.AddHTTPRateLimited(1)
+			s.metrics.Observe(time.Since(start), http.StatusTooManyRequests, metrics.ReasonRateLimited)
+			return
+		}
+	}
 	s.metrics.AddInFlight(1)
 	status, reason := s.serveData(w, r)
 	s.metrics.AddInFlight(-1)
@@ -169,12 +211,13 @@ func (s *Server) serveData(w http.ResponseWriter, r *http.Request) (int, string)
 		http.Error(w, "X-Message-Id is required", http.StatusBadRequest)
 		return http.StatusBadRequest, metrics.ReasonMissingMessageID
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	body, bodyBuf, err := readBodyPooled(r.Body, maxBody+1)
 	if err != nil {
 		s.log.Debug("http data reject", zap.String("reason", metrics.ReasonInvalidBody), zap.Error(err))
 		http.Error(w, "read body", http.StatusBadRequest)
 		return http.StatusBadRequest, metrics.ReasonInvalidBody
 	}
+	defer releaseBodyBuf(bodyBuf)
 	if len(body) > maxBody {
 		s.log.Debug("http data reject", zap.String("reason", metrics.ReasonBodyTooLarge), zap.Int("body_bytes", len(body)))
 		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
@@ -194,27 +237,34 @@ func (s *Server) serveData(w http.ResponseWriter, r *http.Request) (int, string)
 	if ts < 0 {
 		ts = 0
 	}
-	env := &pb.Envelope{
-		Version:      1,
-		Type:         pb.MessageType_MESSAGE_TYPE_DATA_REQUEST,
-		SourceNodeId: s.cfg.NodeID,
-		TimestampMs:  uint64(ts),
-		TraceId:      strings.TrimSpace(r.Header.Get("X-Trace-Id")),
-		Body: &pb.Envelope_DataRequest{DataRequest: &pb.DataRequest{
-			MessageId: msgID,
-			SessionId: strings.TrimSpace(r.Header.Get("X-Session-Id")),
-			Payload:   body,
-		}},
-	}
+	slot := acquireEnvSlot()
+	defer releaseEnvSlot(slot)
+	slot.env.Version = 1
+	slot.env.Type = pb.MessageType_MESSAGE_TYPE_DATA_REQUEST
+	slot.env.SourceNodeId = s.cfg.NodeID
+	slot.env.TimestampMs = uint64(ts)
+	slot.env.TraceId = strings.TrimSpace(r.Header.Get("X-Trace-Id"))
+	slot.dr.MessageId = msgID
+	slot.dr.SessionId = strings.TrimSpace(r.Header.Get("X-Session-Id"))
+	slot.dr.Payload = body
+	env := &slot.env
 
 	resp, err := s.tx.Request(r.Context(), env)
+	if resp != nil {
+		defer udp.ReleaseEnvelope(resp)
+	}
 	if err != nil {
-		s.log.Debug("http data tx thất bại", zap.Uint32("message_id", msgID), zap.Error(err))
-		return writeTxError(w, err, s.metrics)
+		s.log.Debug("http data tx thất bại",
+			zap.Uint32("message_id", msgID),
+			zap.Uint64("transaction_id", env.GetTransactionId()),
+			zap.Error(err),
+		)
+		return writeTxError(w, err, env.GetTransactionId(), s.metrics)
 	}
 	data := resp.GetDataResponse()
 	if data == nil {
 		s.log.Debug("http data empty response", zap.Uint64("transaction_id", resp.GetTransactionId()))
+		setTransactionIDHeader(w, resp.GetTransactionId())
 		http.Error(w, "empty data response", http.StatusBadGateway)
 		return http.StatusBadGateway, metrics.ReasonEmptyResponse
 	}
@@ -241,10 +291,32 @@ func (s *Server) serveData(w http.ResponseWriter, r *http.Request) (int, string)
 	return status, metrics.ReasonOK
 }
 
-func writeTxError(w http.ResponseWriter, err error, met *metrics.Metrics) (int, string) {
+func setTransactionIDHeader(w http.ResponseWriter, txID uint64) {
+	if txID == 0 {
+		return
+	}
+	w.Header().Set("X-Transaction-Id", strconv.FormatUint(txID, 10))
+}
+
+func writeTxError(w http.ResponseWriter, err error, txID uint64, met *metrics.Metrics) (int, string) {
+	setTransactionIDHeader(w, txID)
+	var logicErr *transaction.LogicError
+	if errors.As(err, &logicErr) && logicErr != nil {
+		status, reason := mapLogicError(logicErr)
+		http.Error(w, logicErr.Error(), status)
+		return status, reason
+	}
 	switch {
 	case errors.Is(err, transaction.ErrTransactionTimeout), errors.Is(err, context.DeadlineExceeded):
-		met.AddTransactionTimeout(1)
+		if met != nil {
+			met.AddHTTP504(1)
+			met.AddTransactionTimeout(1)
+			if errors.Is(err, transaction.ErrTransactionTimeout) {
+				met.AddTimeout(1)
+			} else {
+				met.AddContextDeadline(1)
+			}
+		}
 		http.Error(w, err.Error(), http.StatusGatewayTimeout)
 		return http.StatusGatewayTimeout, metrics.ReasonTimeout
 	case errors.Is(err, router.ErrNoEligibleNode), errors.Is(err, router.ErrEmptyCandidates):
@@ -269,6 +341,29 @@ func writeTxError(w http.ResponseWriter, err error, met *metrics.Metrics) (int, 
 	default:
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return http.StatusBadGateway, metrics.ReasonUnknown
+	}
+}
+
+// mapLogicError: Envelope ERROR → HTTP (tránh 504 giả khi Logic đã trả lỗi).
+func mapLogicError(e *transaction.LogicError) (int, string) {
+	if e == nil {
+		return http.StatusBadGateway, metrics.ReasonLogicError
+	}
+	switch e.Code {
+	case pb.ErrorCode_ERROR_CODE_TIMEOUT,
+		pb.ErrorCode_ERROR_CODE_LOGIC_TIMEOUT,
+		pb.ErrorCode_ERROR_CODE_HEARTBEAT_TIMEOUT:
+		return http.StatusGatewayTimeout, metrics.ReasonTimeout
+	case pb.ErrorCode_ERROR_CODE_INVALID_MESSAGE:
+		return http.StatusBadRequest, metrics.ReasonInvalidRequest
+	case pb.ErrorCode_ERROR_CODE_NODE_NOT_AVAILABLE,
+		pb.ErrorCode_ERROR_CODE_OVERLOAD,
+		pb.ErrorCode_ERROR_CODE_NO_ROUTING_TARGET:
+		return http.StatusServiceUnavailable, metrics.ReasonNoRoutingTarget
+	case pb.ErrorCode_ERROR_CODE_UDP_SEND_FAILED:
+		return http.StatusBadGateway, metrics.ReasonUDPSendFailed
+	default:
+		return http.StatusBadGateway, metrics.ReasonLogicError
 	}
 }
 

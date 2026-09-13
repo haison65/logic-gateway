@@ -1,0 +1,24 @@
+# Load config for .\scripts\start.ps1
+# Override: .\scripts\start.ps1 -Clients 3 -ClientCPUs 2 -Duration 60s
+
+client_count: 1
+client_cpus: 2
+
+message_id: 1001
+body:
+body_size: 4096
+timeout: 10s
+
+concurrency: 250
+qps: 10000
+duration: 1m
+n: 0
+unique_session: true
+verbose: false
+
+fail_log_path: /var/log/logic-gateway/fails.jsonl
+fail_log_max: 100000
+
+target:
+session_id:
+master_url:

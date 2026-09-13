@@ -29,6 +29,8 @@ services:
     init: true
     stop_grace_period: 10s
     command: ["-config", "/configs/logic.yaml", "-debug=false"]
+    ports:
+      - "9190:9190/tcp"
     depends_on:
       - http2gw
     networks:

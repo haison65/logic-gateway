@@ -1,0 +1,25 @@
+# Identity only — thong so load lay tu load.request.yaml khi chay start.ps1
+node:
+  node_id: 25
+  instance_id: http2client-6
+  name: http2client-6
+  type: http2_client
+  group: tool-client
+  ip: client-6
+
+target: http://http2gw:8080
+session_id: cli6
+master_url: http://master:9200
+
+message_id: 1001
+body: hello
+timeout: 10s
+concurrency: 1
+qps: 0
+duration: 1s
+n: 0
+unique_session: true
+
+resource:
+  cpu_cores: 2
+  memory: 1G

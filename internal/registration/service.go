@@ -58,6 +58,7 @@ func toNode(req *pb.RegisterRequest) *registry.Node {
 	return &registry.Node{
 		ID:         req.GetNodeId(),
 		InstanceID: strings.TrimSpace(req.GetInstanceId()),
+		Name:       strings.TrimSpace(req.GetInstanceId()),
 		Type:       registry.Type(req.GetNodeType()),
 		Address:    strings.TrimSpace(req.GetIp()),
 		UDPPort:    req.GetPort(),

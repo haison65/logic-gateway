@@ -1,11 +1,11 @@
-# Kill one tracked node by name (master|http2gw|logic-1|logic-2).
+# Kill one tracked node by name (master|http2gw|logic-1|logic-2|logic-3).
 #   .\scripts\kill_node.ps1 -Name logic-1
 # Useful for failover drills: kill logic-1 then send traffic.
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("master", "http2gw", "logic-1", "logic-2")]
+    [ValidateSet("master", "http2gw", "logic-1", "logic-2", "logic-3")]
     [string]$Name
 )
 

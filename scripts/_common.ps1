@@ -12,7 +12,8 @@ $script:NodeDefs = @(
     @{ Name = "master";  Cmd = @("run", "./cmd/master", "-config", "configs/local/master.dev.yaml", "-debug=false"); Port = 9200 },
     @{ Name = "http2gw"; Cmd = @("run", "./cmd/http2gw", "-config", "configs/local/http2gw.dev.yaml", "-debug=false"); Port = 8080 },
     @{ Name = "logic-1"; Cmd = @("run", "./cmd/logic", "-config", "configs/local/logic-1.dev.yaml", "-debug=false"); Port = 9100 },
-    @{ Name = "logic-2"; Cmd = @("run", "./cmd/logic", "-config", "configs/local/logic-2.dev.yaml", "-debug=false"); Port = 9101 }
+    @{ Name = "logic-2"; Cmd = @("run", "./cmd/logic", "-config", "configs/local/logic-2.dev.yaml", "-debug=false"); Port = 9101 },
+    @{ Name = "logic-3"; Cmd = @("run", "./cmd/logic", "-config", "configs/local/logic-3.dev.yaml", "-debug=false"); Port = 9102 }
 )
 
 function Ensure-RunDir {

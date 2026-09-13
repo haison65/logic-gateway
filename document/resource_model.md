@@ -1,31 +1,56 @@
-# document/resource_model.md — Phase 7
+# Resource model
 
-# Resource model (Local)
+## Ba lớp — không lẫn
 
-## Phân biệt hai lớp
+| Lớp | Ví dụ | Enforce OS? |
+|-----|--------|-------------|
+| YAML `resource.cpu_cores` / `memory` | inventory Master / báo cáo | **Không** |
+| `GOMAXPROCS` | số thread scheduler Go | **Không** (cgroup vẫn siết) |
+| Compose `cpus` / `mem_limit` / `cpuset` | Docker cgroup | **Có** |
 
-| Lớp | Ví dụ | Có phải limit OS? |
-|-----|--------|-------------------|
-| **Application metadata** | `resource.cpu_cores` / `resource.memory` trong YAML | **Không** — chỉ inventory/report |
-| **GOMAXPROCS** | env `GOMAXPROCS=4` | **Không** — số thread Go scheduler |
-| **Container cgroup** | Compose `cpus: 4`, `mem_limit: 8g` | **Có** — Docker/Linux enforce |
+---
 
-Không được tuyên bố “đã bind CPU” chỉ vì set `GOMAXPROCS` hoặc ghi YAML.
+## `docker-compose.local.yml` (số trong file)
 
-## Target Local (bảng)
+| Service | cpus | cpuset | mem_limit | GOMAXPROCS |
+|---------|------|--------|-----------|------------|
+| master | 1.0 | `"0"` | 512m | 1 |
+| http2gw | 1.0 | `"20"` | 2g | 1 |
+| logic-1 | 2.0 | `"3-4"` | 2g | 2 |
+| logic-2 | 2.0 | `"5-6"` | 2g | 2 |
+| logic-3 | 2.0 | `"7-8"` | 2g | 2 |
+| **Σ server** | **8** | | **~8.5G** | |
+| client-* (load) | 2.0 mặc định (file); ghi đè bằng `start.ps1 -ClientCPUs` | không pin | 1g | ceil(cpus) |
 
-| Node | CPU quota | Memory limit |
-|------|----------:|-------------:|
-| HTTP2GW | 4 | 8G |
-| Logic-1 | 6 | 8G |
-| Logic-2 | 6 | 8G |
-| Master | 1 | 512M |
-| **Tổng server** | **17** | **~24.5G** |
+`cpuset` gắn CPU **trong Docker VM**. Host Windows không map 1:1.
 
-Máy host mục tiêu: 16 CPU / 32 GB — **quota CPU Compose (17) có thể > 16 core vật lý**.
-Docker sẽ time-slice; nếu cần khít 16: giảm Master hoặc Logic cpus trong `docker-compose.local.yml`.
+`docker-compose.yml` (tối thiểu): **không** set cpus/mem.
 
-RAM còn lại (~7.5G+) cho OS + client/perf trên host.
+---
+
+## Client CPU override
+
+`start_load.ps1` tạo `scripts/run-logs/<stamp>_client-cpus.override.yml` rồi:
+
+```text
+docker compose -f docker-compose.local.yml -f <override> --profile load run …
+```
+
+**Không** dùng `docker compose run --cpus` — Compose v5 báo `unknown flag`.
+
+---
+
+## Capacity liên quan code
+
+| Mục | Giá trị |
+|-----|---------|
+| Logic DATA workers | `max(128, min(2048, cpu_cores×256))`; thiếu `cpu_cores` → 512 |
+| UDP buffer | 32 MiB request; actual OS value may be lower |
+| H2 streams/conn | 1024 |
+
+YAML `logic-*.dev.yaml` có thể ghi `cpu_cores: 6` — đó là **metadata**, không phải limit `start_local`.
+
+---
 
 ## Verify
 
@@ -34,10 +59,8 @@ docker compose -f docker-compose.local.yml up -d --build
 docker stats --no-stream
 ```
 
-Cột `MEM USAGE / LIMIT` phải phản ánh ~8Gi / 512Mi.  
-Cột `CPU %` bị chặn bởi quota (không phải chứng minh affinity pin core).
+---
 
-## HA wording
+## HA
 
-Single-host Active-Active Logic = **application failover** (Phase 6 retry + DEAD filter).  
-**Không** phải infrastructure HA (host chết → tất cả chết).
+Single-host Active-Active = failover ứng dụng. Host chết → toàn stack chết. Registry không persistent.

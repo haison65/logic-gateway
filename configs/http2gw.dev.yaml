@@ -9,6 +9,8 @@ http:
 udp:
   listen: 127.0.0.1
   port: 9000
+  inbound_queue_size: 8192
+  inbound_workers: 2
 
 heartbeat:
   interval: 1000ms

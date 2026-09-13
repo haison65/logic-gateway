@@ -1,24 +1,8 @@
-# Local deployment with REAL container resource limits (Phase 7).
+# Local: clients (profile load) -> http2gw -> logic x3
+# Load: configs/local/load.request.yaml + .\scripts\start.ps1
 #
-# Target (application + cgroup):
-#   HTTP2GW: 4 CPU, 8G RAM
-#   Logic×2: 6 CPU, 8G RAM each
-#   Master:  1 CPU, 512M
-#
-# GOMAXPROCS = Go scheduler concurrency hint (NOT the cgroup CPU quota).
-# Actual CPU/memory enforcement = deploy.resources.limits / cpus / mem_limit.
-#
-# Prerequisites:
-#   - Docker Desktop → Settings → Resources: đủ CPU (≥16 khuyến nghị) và RAM (≥24G cho 8+8+8).
-#   - Nếu VM Docker < 24G: giảm mem_limit cho khớp VM (document trong report).
-#
-# Client/Performance chạy trên HOST (go run), không trong Compose — tránh vượt RAM.
-#
-# Usage:
-#   docker compose -f docker-compose.local.yml up -d --build
-#   docker stats
-#   curl.exe http://127.0.0.1:9200/v1/nodes
-#   go run ./cmd/client -config configs/local/perf-1.dev.yaml
+# cpuset: master=0 prometheus=1 logic=3-4/5-6/7-8
+#         client-1..5=9-10..17-18 client-6=9-10 http2gw=20
 
 services:
   master:
@@ -34,6 +18,7 @@ services:
     environment:
       - GOMAXPROCS=1
     cpus: 1.0
+    cpuset: "0"
     mem_limit: 512m
     ports:
       - "9200:9200/tcp"
@@ -58,12 +43,17 @@ services:
     volumes:
       - ./configs/local/http2gw.docker.yaml:/configs/http2gw.yaml:ro
     environment:
-      # Soft concurrency hint only — cgroup limit is cpus: 4 below.
-      - GOMAXPROCS=4
-    cpus: 4.0
-    mem_limit: 8g
+      - GOMAXPROCS=1
+      - GOGC=200
+    cpus: 1.0
+    cpuset: "20"
+    mem_limit: 2g
+    user: "0:0"
+    cap_add:
+      - NET_ADMIN
     ports:
       - "8080:8080/tcp"
+      - "6060:6060/tcp"
     depends_on:
       - master
     networks:
@@ -86,10 +76,16 @@ services:
     command: ["-config", "/configs/logic.yaml", "-debug=false"]
     volumes:
       - ./configs/local/logic-1.docker.yaml:/configs/logic.yaml:ro
+    ports:
+      - "9191:9190/tcp"
     environment:
-      - GOMAXPROCS=6
-    cpus: 6.0
-    mem_limit: 8g
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "3-4"
+    mem_limit: 2g
+    user: "0:0"
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - http2gw
       - master
@@ -113,13 +109,220 @@ services:
     command: ["-config", "/configs/logic.yaml", "-debug=false"]
     volumes:
       - ./configs/local/logic-2.docker.yaml:/configs/logic.yaml:ro
+    ports:
+      - "9192:9190/tcp"
     environment:
-      - GOMAXPROCS=6
-    cpus: 6.0
-    mem_limit: 8g
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "5-6"
+    mem_limit: 2g
+    user: "0:0"
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - http2gw
       - master
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  logic-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: logic
+    image: logic-gateway/logic:local
+    hostname: logic-3
+    init: true
+    stop_grace_period: 10s
+    command: ["-config", "/configs/logic.yaml", "-debug=false"]
+    volumes:
+      - ./configs/local/logic-3.docker.yaml:/configs/logic.yaml:ro
+    ports:
+      - "9193:9190/tcp"
+    environment:
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "7-8"
+    mem_limit: 2g
+    user: "0:0"
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - http2gw
+      - master
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  client-1:
+    profiles: ["load"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    image: logic-gateway/client:local
+    hostname: client-1
+    init: true
+    volumes:
+      - ./configs/local/http2client-1.docker.yaml:/configs/client.yaml:ro
+      - ./scripts/fail-logs:/var/log/logic-gateway
+      - ./scripts/run-logs:/var/log/run-logs
+    environment:
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "9-10"
+    mem_limit: 1g
+    depends_on:
+      - http2gw
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  client-2:
+    profiles: ["load"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    image: logic-gateway/client:local
+    hostname: client-2
+    init: true
+    volumes:
+      - ./configs/local/http2client-2.docker.yaml:/configs/client.yaml:ro
+      - ./scripts/fail-logs:/var/log/logic-gateway
+      - ./scripts/run-logs:/var/log/run-logs
+    environment:
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "11-12"
+    mem_limit: 1g
+    depends_on:
+      - http2gw
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  client-3:
+    profiles: ["load"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    image: logic-gateway/client:local
+    hostname: client-3
+    init: true
+    volumes:
+      - ./configs/local/http2client-3.docker.yaml:/configs/client.yaml:ro
+      - ./scripts/fail-logs:/var/log/logic-gateway
+      - ./scripts/run-logs:/var/log/run-logs
+    environment:
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "13-14"
+    mem_limit: 1g
+    depends_on:
+      - http2gw
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  client-4:
+    profiles: ["load"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    image: logic-gateway/client:local
+    hostname: client-4
+    init: true
+    volumes:
+      - ./configs/local/http2client-4.docker.yaml:/configs/client.yaml:ro
+      - ./scripts/fail-logs:/var/log/logic-gateway
+      - ./scripts/run-logs:/var/log/run-logs
+    environment:
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "15-16"
+    mem_limit: 1g
+    depends_on:
+      - http2gw
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  client-5:
+    profiles: ["load"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    image: logic-gateway/client:local
+    hostname: client-5
+    init: true
+    volumes:
+      - ./configs/local/http2client-5.docker.yaml:/configs/client.yaml:ro
+      - ./scripts/fail-logs:/var/log/logic-gateway
+      - ./scripts/run-logs:/var/log/run-logs
+    environment:
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "17-18"
+    mem_limit: 1g
+    depends_on:
+      - http2gw
+    networks:
+      - app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  client-6:
+    profiles: ["load"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    image: logic-gateway/client:local
+    hostname: client-6
+    init: true
+    volumes:
+      - ./configs/local/http2client-6.docker.yaml:/configs/client.yaml:ro
+      - ./scripts/fail-logs:/var/log/logic-gateway
+      - ./scripts/run-logs:/var/log/run-logs
+    environment:
+      - GOMAXPROCS=2
+    cpus: 2.0
+    cpuset: "9-10"
+    mem_limit: 1g
+    depends_on:
+      - http2gw
     networks:
       - app
     logging:
@@ -144,6 +347,8 @@ services:
       - "9090:9090/tcp"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    cpus: 1.0
+    cpuset: "1"
     depends_on:
       - http2gw
     networks:

@@ -10,10 +10,16 @@ node:
 http:
   listen: 127.0.0.1
   port: 8080
+  max_rps: 10000
+  max_rps_burst: 2000
+  max_pending: 600
+  pprof_listen: "127.0.0.1:6060"
 
 udp:
   listen: 127.0.0.1
   port: 9000
+  inbound_queue_size: 16384
+  inbound_workers: 2
 
 heartbeat:
   interval: 1000ms
@@ -32,7 +38,7 @@ services:
     message_types: [1001, 1002, 1003]
 
 resource:
-  cpu_cores: 4
-  memory: 8G
+  cpu_cores: 1
+  memory: 2G
 
 master_url: http://127.0.0.1:9200

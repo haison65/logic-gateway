@@ -1,0 +1,34 @@
+node:
+  node_id: 4
+  instance_id: logic-3
+  name: logic-3
+  type: logic
+  group: local-server
+  ip: logic-3
+
+udp:
+  listen: 0.0.0.0
+  port: 9102
+
+gateway:
+  host: http2gw
+  port: 9000
+
+services:
+  - service_id: 100
+    service_name: call
+    message_types: [1001, 1002, 1003]
+
+heartbeat:
+  interval: 1000ms
+  timeout: 3000ms
+
+resource:
+  cpu_cores: 2
+  memory: 2G
+
+master_url: http://master:9200
+
+metrics:
+  listen: 0.0.0.0
+  port: 9190

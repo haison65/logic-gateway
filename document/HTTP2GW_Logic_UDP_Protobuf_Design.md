@@ -1,5 +1,20 @@
 # HTTP2GW - Logic UDP Protobuf Communication Design
 
+> **Phân loại tài liệu:** ý đồ thiết kế (design intent).  
+> **Triển khai hiện tại (SoT = code):** xem `README.md`, `document/guide_setup.md`, `document/docker.md`.  
+> Tài liệu này mô tả protocol và design intent; khi khác code, code có hiệu lực.  
+>
+> ### Roadmap / phase (tránh hiểu nhầm “design đã xong 100%”)
+>
+> | Phase | Nội dung | Trạng thái code |
+> |-------|----------|-----------------|
+> | **P0 (hiện tại)** | 1×HTTP2GW + N×Logic; REGISTER/HB/DATA UDP+protobuf; registry+router+transaction; Logic **echo** 1001–1003; metrics GW+Logic | **Đã có** |
+> | **P1 (sau)** | `http.remote` outbound §12 (Logic→GW→HTTP remote) bật trên môi trường thật; ERROR envelope → Complete waiter (đã có trong code) | Outbound **code+test sẵn**, config local thường `remote: ""` |
+> | **P2 (sau)** | **Multi-HTTP2GW cluster** (registry/route liên GW) | **Chưa** — claim “Multi HTTP2GW” ở §1 là tầm nhìn, chưa SoT |
+> | **P3 (sau)** | Logic **business** thật (thay echo); auth; registry bền vững; UDP fragmentation | **Chưa** |
+>
+> Runtime invariant: Master là control-plane tách DATA; Gateway có một UDP receive consumer; failover ứng dụng tối đa 1 lần; `failover_retry_total` tăng trên Send failure / transaction timeout.
+
 ## 1. Overview
 
 Thiết kế giao tiếp giữa HTTP2GW và Logic sử dụng:
@@ -15,7 +30,8 @@ Mục tiêu:
 -   Dynamic registration
 -   Health monitoring
 -   Message routing
--   Multi HTTP2GW / Multi Logic instance
+-   Multi Logic instance (**P0**)
+-   Multi HTTP2GW instance (**P2 — chưa implement**)
 
 ------------------------------------------------------------------------
 
@@ -514,31 +530,45 @@ routing:
 
 # 17. Metrics
 
-HTTP2GW:
+### Design intent vs implementation
 
-    logic_registered_total
+HTTP2GW exposition: `GET /metrics` (Prometheus) và `GET /metrics.json`.  
+Prefix triển khai: `http2gw_`.
 
-    heartbeat_success_total
+    http2gw_http_requests_total{status,result}
+    http2gw_http_requests_fail_total{status,reason}
+    http2gw_http_requests_in_flight
+    http2gw_http_request_duration_seconds
 
-    heartbeat_timeout_total
+    http2gw_logic_registered_total
+    http2gw_heartbeat_success_total
+    http2gw_heartbeat_timeout_total
+    http2gw_udp_rx_total
+    http2gw_udp_tx_total
+    http2gw_route_failed_total
+    http2gw_transaction_timeout_total
+    http2gw_logic_nodes{state}
+    http2gw_failover_retry_total
+    http2gw_logic_routed_total{node_id,node}
 
-    udp_rx_total
+Logic (khi YAML `metrics.port` > 0): `GET /metrics`, prefix `logic_`:
 
-    udp_tx_total
+    logic_requests_total{node,node_id}
+    logic_register_status{node,node_id}          # 1 = REGISTER accepted
+    logic_heartbeat_rtt_seconds{node,node_id}    # RTT HB gần nhất
+    logic_queue_size{node,node_id}               # in-flight DATA
+    logic_processing_duration_seconds{...}
+    (+ udp_* / pool_* chẩn đoán)
 
-    route_failed_total
+Triển khai local/Docker bổ sung (không thay mô hình message):
 
-    transaction_timeout_total
+- UDP `SO_RCVBUF`/`SO_SNDBUF` 32 MiB request; actual OS value may be lower
+- Logic DATA worker pool (`cpu_cores×256`, clamp 128–2048)
+- HTTP/2 `MaxConcurrentStreams=1024`
+- Client tải: 4 HTTP/2 connection / host
+- Envelope `MESSAGE_TYPE_ERROR` → Manager.Fail / HTTP map (tránh 504 giả)
 
-Logic:
-
-    register_status
-
-    heartbeat_rtt
-
-    processing_latency
-
-    queue_size
+Vận hành / PromQL: `document/huong_dan_prometheus_report.md`.
 
 ------------------------------------------------------------------------
 
@@ -555,10 +585,11 @@ HTTP2GW:
 
 Logic:
 
--   business processing
 -   capability registration
 -   heartbeat response
 -   data handling
+-   business processing (**P3** — hiện tại echo 1001–1003 cho load-test mesh)
+-   outbound qua GW `http.remote` (**P1** — code sẵn, config thường tắt)
 
 Protocol:
 

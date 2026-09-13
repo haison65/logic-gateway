@@ -48,11 +48,25 @@ type HTTP struct {
 	// Remote là base URL HTTP của server ngoài cho chiều Logic → HTTP2GW → Remote (§12).
 	// Design không ghi URL; để trống thì DATA_REQUEST từ Logic nhận Envelope ERROR NO_ROUTING_TARGET.
 	Remote string `yaml:"remote"`
+	// MaxRPS: giới hạn số POST /v1/data được admit mỗi giây (0 = không giới hạn).
+	// Vượt limit → HTTP 429 ngay (Allow, không xếp hàng chờ).
+	MaxRPS float64 `yaml:"max_rps"`
+	// MaxRPSBurst: burst token bucket (0 = mặc định).
+	MaxRPSBurst int `yaml:"max_rps_burst"`
+	// MaxPending: nếu manager_pending > ngưỡng → HTTP 429 (0 = tắt). Bảo vệ 1 CPU khỏi sóng 504.
+	MaxPending int `yaml:"max_pending"`
+	// PprofListen: địa chỉ HTTP riêng cho /debug/pprof/ (vd "0.0.0.0:6060"). Trống = tắt.
+	PprofListen string `yaml:"pprof_listen"`
 }
 
 type UDP struct {
 	Listen string `yaml:"listen"`
 	Port   int    `yaml:"port"`
+	// InboundQueueSize: bounded channel giữa UDP Receive và dispatch workers.
+	// 0 = mặc định (8192). Chỉ áp dụng HTTP2GW.
+	InboundQueueSize int `yaml:"inbound_queue_size"`
+	// InboundWorkers: số worker xử lý envelope sau enqueue. 0 = mặc định (2).
+	InboundWorkers int `yaml:"inbound_workers"`
 }
 
 type Heartbeat struct {
@@ -139,11 +153,23 @@ func (c HTTP2GW) Validate() error {
 	if c.HTTP.Port < 0 || c.HTTP.Port > 65535 {
 		return fmt.Errorf("http.port %d out of range", c.HTTP.Port)
 	}
+	if c.HTTP.MaxRPS < 0 {
+		return fmt.Errorf("http.max_rps must be >= 0")
+	}
+	if c.HTTP.MaxRPSBurst < 0 || c.HTTP.MaxRPSBurst > 100_000 {
+		return fmt.Errorf("http.max_rps_burst %d out of range", c.HTTP.MaxRPSBurst)
+	}
 	if (c.HTTP.TLSCert == "") != (c.HTTP.TLSKey == "") {
 		return fmt.Errorf("http.tls_cert and http.tls_key must both be set or both empty")
 	}
 	if c.UDP.Port < 0 || c.UDP.Port > 65535 {
 		return fmt.Errorf("udp.port %d out of range", c.UDP.Port)
+	}
+	if c.UDP.InboundQueueSize < 0 || c.UDP.InboundQueueSize > 100_000 {
+		return fmt.Errorf("udp.inbound_queue_size %d out of range", c.UDP.InboundQueueSize)
+	}
+	if c.UDP.InboundWorkers < 0 || c.UDP.InboundWorkers > 64 {
+		return fmt.Errorf("udp.inbound_workers %d out of range", c.UDP.InboundWorkers)
 	}
 	if c.Heartbeat.Interval.Duration() <= 0 {
 		return fmt.Errorf("heartbeat.interval must be > 0")
