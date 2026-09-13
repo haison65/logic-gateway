@@ -29,8 +29,13 @@ func main() {
 	flag.IntVar(&opt.n, "n", 1, "tổng số request (0 = không giới hạn, dùng với -d)")
 	flag.IntVar(&opt.c, "c", 1, "số goroutine / stream song song")
 	flag.DurationVar(&opt.duration, "d", 0, "chạy trong khoảng thời gian (0 = theo -n)")
-	flag.Float64Var(&opt.qps, "qps", 0, "giới hạn request/giây (0 = không giới hạn)")
+	flag.Float64Var(&opt.qps, "qps", 0, "giới hạn start request/giây đều (token bucket burst=1; 0 = không giới hạn)")
 	flag.BoolVar(&opt.verbose, "v", false, "in từng request lỗi khi đẩy tải")
+	flag.StringVar(&opt.failLogPath, "fail-log", "", "file JSONL ghi các request fail (append)")
+	flag.IntVar(&opt.failLogMax, "fail-log-max", 100000, "giới hạn số dòng fail log (0 = không giới hạn)")
+	flag.StringVar(&opt.summaryLogPath, "summary-log", "", "file JSON tóm tắt cuối run")
+	flag.StringVar(&opt.clientName, "client-name", "", "tên client ghi vào summary JSON")
+	flag.Float64Var(&opt.clientCPUs, "client-cpus", 0, "CPU quota client (ghi vào summary)")
 	flag.Parse()
 
 	setFlags := map[string]bool{}
@@ -146,7 +151,16 @@ func main() {
 	fmt.Fprintf(os.Stderr, "load HTTP/2 h2c  n=%d c=%d d=%s qps=%.0f -> %s\n", opt.n, opt.c, opt.duration, opt.qps, opt.addr)
 	start := time.Now()
 	st := runLoad(ctx, client, opt)
-	st.print(time.Since(start), opt.c)
+	elapsed := time.Since(start)
+	st.print(elapsed, opt.c)
+	if path := strings.TrimSpace(opt.summaryLogPath); path != "" {
+		sum := st.buildSummary(opt, start, elapsed)
+		if err := writeSummaryJSON(path, sum); err != nil {
+			fmt.Fprintln(os.Stderr, "summary log:", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "summary_log: %s\n", path)
+		}
+	}
 	if st.fail > 0 {
 		os.Exit(1)
 	}

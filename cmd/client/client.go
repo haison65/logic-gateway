@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/time/rate"
 )
 
 type options struct {
@@ -30,6 +32,11 @@ type options struct {
 	duration      time.Duration
 	qps           float64
 	verbose       bool
+	failLogPath   string
+	failLogMax    int
+	summaryLogPath string
+	clientName    string
+	clientCPUs    float64
 }
 
 type callResult struct {
@@ -37,21 +44,43 @@ type callResult struct {
 	protoMajor int
 	latency    time.Duration
 	txID       string
+	traceID    string
+	sessionID  string
 	body       []byte
 	err        error
 }
 
 func newH2CClient(timeout time.Duration) *http.Client {
-	return &http.Client{
-		Timeout: timeout,
-		Transport: &http2.Transport{
+	// F2: nhiều HTTP/2 connection / host để vượt giới hạn stream/conn.
+	const conns = 4
+	transports := make([]*http2.Transport, conns)
+	for i := 0; i < conns; i++ {
+		transports[i] = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 				var d net.Dialer
 				return d.DialContext(ctx, network, addr)
 			},
-		},
+		}
 	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: &roundRobinH2Transport{ts: transports},
+	}
+}
+
+// roundRobinH2Transport xoay vòng nhiều http2.Transport (mỗi cái ~1 conn/host).
+type roundRobinH2Transport struct {
+	ts []*http2.Transport
+	n  atomic.Uint64
+}
+
+func (r *roundRobinH2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if r == nil || len(r.ts) == 0 {
+		return nil, fmt.Errorf("http2 transport not configured")
+	}
+	i := r.n.Add(1)
+	return r.ts[int(i%uint64(len(r.ts)))].RoundTrip(req)
 }
 
 func doRequest(ctx context.Context, client *http.Client, opt options, seq int) callResult {
@@ -81,20 +110,38 @@ func doRequest(ctx context.Context, client *http.Client, opt options, seq int) c
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return callResult{latency: time.Since(start), err: err}
+		return callResult{latency: time.Since(start), traceID: trace, sessionID: session, err: err}
 	}
 	defer resp.Body.Close()
 	out, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return callResult{status: resp.StatusCode, protoMajor: resp.ProtoMajor, latency: time.Since(start), err: err}
+		return callResult{
+			status:     resp.StatusCode,
+			protoMajor: resp.ProtoMajor,
+			latency:    time.Since(start),
+			txID:       resp.Header.Get("X-Transaction-Id"),
+			traceID:    trace,
+			sessionID:  session,
+			err:        err,
+		}
 	}
 	return callResult{
 		status:     resp.StatusCode,
 		protoMajor: resp.ProtoMajor,
 		latency:    time.Since(start),
 		txID:       resp.Header.Get("X-Transaction-Id"),
+		traceID:    trace,
+		sessionID:  session,
 		body:       out,
 	}
+}
+
+func newQPSLimiter(qps float64) *rate.Limiter {
+	if qps <= 0 {
+		return nil
+	}
+	// burst=1 → khoảng cách đều ~1/qps giữa các lần được phép start (không dồn burst).
+	return rate.NewLimiter(rate.Limit(qps), 1)
 }
 
 func runLoad(ctx context.Context, client *http.Client, opt options) stats {
@@ -106,16 +153,18 @@ func runLoad(ctx context.Context, client *http.Client, opt options) stats {
 		wg      sync.WaitGroup
 	)
 
-	var limiter <-chan time.Time
-	if opt.qps > 0 {
-		interval := time.Duration(float64(time.Second) / opt.qps)
-		if interval < time.Microsecond {
-			interval = time.Microsecond
-		}
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		limiter = t.C
+	fl, err := newFailLogger(opt.failLogPath, opt.failLogMax)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fail log: %v\n", err)
 	}
+	defer func() {
+		fl.close()
+		if s := fl.summary(); s != "" {
+			fmt.Fprintln(os.Stderr, s)
+		}
+	}()
+
+	limiter := newQPSLimiter(opt.qps)
 
 	deadline := time.Time{}
 	if opt.duration > 0 {
@@ -138,18 +187,28 @@ func runLoad(ctx context.Context, client *http.Client, opt options) stats {
 				return
 			}
 			if limiter != nil {
-				select {
-				case <-ctx.Done():
+				// Chờ token đều theo qps; không drop tick như time.Ticker.
+				if err := limiter.Wait(ctx); err != nil {
 					return
-				case <-limiter:
+				}
+				if ctx.Err() != nil || stopped.Load() {
+					return
+				}
+				if !deadline.IsZero() && time.Now().After(deadline) {
+					stopped.Store(true)
+					return
 				}
 			}
 			r := doRequest(ctx, client, opt, n)
 			mu.Lock()
 			st.add(r)
 			mu.Unlock()
-			if opt.verbose && (r.err != nil || r.status >= 400) {
-				fmt.Printf("fail seq=%d status=%d err=%v\n", n, r.status, r.err)
+			failed := r.err != nil || r.status >= 400 || r.status == 0
+			if failed {
+				fl.log(failEntryFromResult(n, r))
+			}
+			if opt.verbose && failed {
+				fmt.Printf("fail seq=%d status=%d tx=%s trace=%s err=%v\n", n, r.status, r.txID, r.traceID, r.err)
 			}
 		}
 	}
