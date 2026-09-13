@@ -56,3 +56,52 @@ func TestInFlight(t *testing.T) {
 		t.Fatal(m.Snapshot().InFlight)
 	}
 }
+
+func TestAddLogicRouted(t *testing.T) {
+	t.Parallel()
+	m := New()
+	m.AddLogicRouted(2, "logic-1")
+	m.AddLogicRouted(2, "logic-1")
+	m.AddLogicRouted(3, "logic-2")
+	s := m.Snapshot()
+	if s.LogicRoutedByNode["logic-1"] != 2 || s.LogicRoutedByNode["logic-2"] != 1 {
+		t.Fatalf("logic_routed_by_node = %+v", s.LogicRoutedByNode)
+	}
+	// empty name falls back to node_id
+	m.AddLogicRouted(9, "")
+	if m.Snapshot().LogicRoutedByNode["9"] != 1 {
+		t.Fatalf("fallback label: %+v", m.Snapshot().LogicRoutedByNode)
+	}
+}
+
+func TestManagerAndUDPDiagCounters(t *testing.T) {
+	t.Parallel()
+	m := New()
+	m.AddManagerCreated(2)
+	m.AddManagerCompleted(1)
+	m.AddManagerTimeout(1)
+	m.AddManagerCompleteNotFound(3)
+	m.SetManagerPending(7)
+	m.AddGWUDPDataRequestTX(4)
+	m.AddGWUDPDataResponseRX(5)
+	m.AddGWUDPSendError(1)
+	m.AddGWUDPReceiveError(2)
+	m.AddHTTP504(6)
+	m.AddTimeout(6)
+	m.AddContextDeadline(1)
+	m.ObserveManagerWait(10 * time.Millisecond)
+	m.ObserveTransactionTotal(20 * time.Millisecond)
+	s := m.Snapshot()
+	if s.ManagerCreatedTotal != 2 || s.ManagerCompletedTotal != 1 || s.ManagerTimeoutTotal != 1 {
+		t.Fatalf("manager counters %+v", s)
+	}
+	if s.ManagerCompleteNotFoundTotal != 3 || s.ManagerPending != 7 {
+		t.Fatalf("manager pending/miss %+v", s)
+	}
+	if s.GWUDPDataRequestTXTotal != 4 || s.GWUDPDataResponseRXTotal != 5 {
+		t.Fatalf("udp data %+v", s)
+	}
+	if s.HTTP504Total != 6 || s.TimeoutTotal != 6 || s.ContextDeadlineTotal != 1 {
+		t.Fatalf("504 counters %+v", s)
+	}
+}

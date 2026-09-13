@@ -303,7 +303,8 @@ func TestRequestSuccess(t *testing.T) {
 	t.Parallel()
 	m := NewManager()
 	tr := &stubTransport{}
-	svc, err := NewService(m, &stubRouter{node: destNode()}, tr, Config{Timeout: time.Second})
+	routed := &stubRouted{}
+	svc, err := NewService(m, &stubRouter{node: destNode()}, tr, Config{Timeout: time.Second, Metrics: routed})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,6 +334,20 @@ func TestRequestSuccess(t *testing.T) {
 	if got.GetType() != pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE {
 		t.Fatalf("got %+v", got)
 	}
+	if routed.n.Load() != 1 || routed.lastID.Load() != 1 {
+		t.Fatalf("routed metric: n=%d id=%d", routed.n.Load(), routed.lastID.Load())
+	}
+}
+
+type stubRouted struct {
+	NopMetrics
+	n      atomic.Int64
+	lastID atomic.Uint32
+}
+
+func (s *stubRouted) AddLogicRouted(nodeID uint32, _ string) {
+	s.n.Add(1)
+	s.lastID.Store(nodeID)
 }
 
 func TestRequestRouteFailure(t *testing.T) {
@@ -450,6 +465,26 @@ func TestRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestRequestTimeoutNoFailover(t *testing.T) {
+	t.Parallel()
+	m := NewManager()
+	n1 := &registry.Node{ID: 2, Type: registry.TypeLogic, Address: "127.0.0.1", UDPPort: 9100}
+	n2 := &registry.Node{ID: 3, Type: registry.TypeLogic, Address: "127.0.0.1", UDPPort: 9101}
+	rt := &stubExcludeRouter{nodes: []*registry.Node{n1, n2}}
+	tr := &stubTransport{}
+	svc, _ := NewService(m, rt, tr, Config{Timeout: 25 * time.Millisecond})
+	t.Cleanup(func() { _ = svc.Close() })
+	_, err := svc.Request(context.Background(), dataReq(0, 1001))
+	if !errors.Is(err, ErrTransactionTimeout) {
+		t.Fatalf("err = %v", err)
+	}
+	if tr.sends.Load() != 1 {
+		t.Fatalf("sends = %d want 1 (no failover on Wait timeout)", tr.sends.Load())
+	}
+	if rt.n.Load() != 1 {
+		t.Fatalf("routeCalls = %d want 1", rt.n.Load())
+	}
+}
 
 func TestRequestContextCancel(t *testing.T) {
 	t.Parallel()
@@ -494,6 +529,35 @@ func TestOnResponse(t *testing.T) {
 	got, err := m.Wait(context.Background(), 30)
 	if err != nil || got.GetTransactionId() != 30 {
 		t.Fatalf("got %+v err=%v", got, err)
+	}
+}
+
+func TestOnResponseErrorCompletesWait(t *testing.T) {
+	t.Parallel()
+	m := NewManager()
+	svc, _ := NewService(m, &stubRouter{node: destNode()}, &stubTransport{}, Config{})
+	t.Cleanup(func() { _ = svc.Close() })
+	if _, err := m.Create(31); err != nil {
+		t.Fatal(err)
+	}
+	errEnv := &pb.Envelope{
+		Type:          pb.MessageType_MESSAGE_TYPE_ERROR,
+		TransactionId: 31,
+		Body: &pb.Envelope_Error{Error: &pb.ErrorMessage{
+			Code:    pb.ErrorCode_ERROR_CODE_INVALID_MESSAGE,
+			Message: "unsupported message_id",
+		}},
+	}
+	if err := svc.OnResponse(errEnv); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Wait(context.Background(), 31)
+	if got != nil {
+		t.Fatalf("want nil env, got %+v", got)
+	}
+	var le *LogicError
+	if !errors.As(err, &le) || le.Code != pb.ErrorCode_ERROR_CODE_INVALID_MESSAGE {
+		t.Fatalf("err = %v", err)
 	}
 }
 

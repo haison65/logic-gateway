@@ -9,7 +9,13 @@ import (
 // Config cấu hình timeout của một request/response. Độc lập heartbeat timeout.
 type Config struct {
 	Timeout time.Duration
+	// Metrics optional instrumentation (nil = bỏ qua).
+	Metrics MetricsSink
 }
+
+// RoutedCounter nhận thông báo khi gateway đã Route + Send thành công tới một Logic.
+// Giữ alias tương thích; MetricsSink bao gồm method này.
+type RoutedCounter = MetricsSink
 
 func (c Config) timeoutOrDefault() time.Duration {
 	if c.Timeout <= 0 {

@@ -4,6 +4,7 @@ import (
 	"hash/fnv"
 	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/haison65/logic-gateway/internal/registry"
 )
@@ -17,9 +18,13 @@ type vnode struct {
 }
 
 // ConsistentHash ánh xạ key ổn định lên candidate hiện tại (FNV-1a 64-bit).
-// Vòng hash được dựng lại mỗi lần Select để luôn theo tập node mới.
+// Ring được cache theo fingerprint tập node ID — rebuild khi tập candidate đổi (P0.1).
 type ConsistentHash struct {
 	virtualNodes int
+
+	mu       sync.Mutex
+	cachedFP uint64
+	ring     []vnode
 }
 
 // NewConsistentHash tạo strategy. virtualNodes <= 0 thì dùng DefaultVirtualNodes.
@@ -42,13 +47,42 @@ func (c *ConsistentHash) Select(nodes []*registry.Node, key string) (*registry.N
 		return nil, ErrInvalidRoutingKey
 	}
 
-	ring := c.buildRing(nodes)
+	fp := nodesFingerprint(nodes)
+	c.mu.Lock()
+	if c.ring == nil || fp != c.cachedFP {
+		c.ring = c.buildRing(nodes)
+		c.cachedFP = fp
+	}
+	ring := c.ring
+	c.mu.Unlock()
+
 	h := hashString(key)
 	i := sort.Search(len(ring), func(i int) bool { return ring[i].hash >= h })
 	if i == len(ring) {
 		i = 0
 	}
 	return ring[i].node, nil
+}
+
+func nodesFingerprint(nodes []*registry.Node) uint64 {
+	h := fnv.New64a()
+	var buf [8]byte
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		id := uint64(n.ID)
+		buf[0] = byte(id)
+		buf[1] = byte(id >> 8)
+		buf[2] = byte(id >> 16)
+		buf[3] = byte(id >> 24)
+		buf[4] = byte(id >> 32)
+		buf[5] = byte(id >> 40)
+		buf[6] = byte(id >> 48)
+		buf[7] = byte(id >> 56)
+		_, _ = h.Write(buf[:])
+	}
+	return h.Sum64()
 }
 
 func (c *ConsistentHash) buildRing(nodes []*registry.Node) []vnode {

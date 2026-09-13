@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/haison65/logic-gateway/internal/registry"
@@ -13,7 +14,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// maxRouteAttempts: lần 1 + tối đa 1 lần failover (exclude node vừa fail).
+// maxRouteAttempts: lần 1 + tối đa 1 lần failover khi Send fail (exclude node vừa fail).
+// Wait timeout không failover — tránh nhân đôi UDP khi Case B (mất/trễ RESP) trên 1 CPU.
 const maxRouteAttempts = 2
 
 // Router abstraction tối thiểu; không phụ thuộc concrete *router.Router.
@@ -32,6 +34,7 @@ type Service struct {
 	router    Router
 	transport udp.Transport
 	timeout   time.Duration
+	met       RoutedCounter
 }
 
 // NewService tạo Service. timeout <= 0 thì DefaultTimeout.
@@ -53,12 +56,23 @@ func NewService(mgr *Manager, rt Router, tr udp.Transport, cfg Config) (*Service
 		router:    rt,
 		transport: tr,
 		timeout:   cfg.timeoutOrDefault(),
+		met:       cfg.Metrics,
 	}, nil
 }
 
 // Request gửi DATA_REQUEST và chờ DATA_RESPONSE theo transaction_id.
-// Nếu Send thất bại hoặc Wait timeout: thử lại tối đa 1 lần, exclude node vừa fail (Active-Active failover).
+// Send thất bại: thử lại tối đa 1 lần, exclude node vừa fail.
+// Wait timeout: trả ErrTransactionTimeout ngay (không failover).
 func (s *Service) Request(ctx context.Context, req *pb.Envelope) (*pb.Envelope, error) {
+	start := time.Now()
+	env, err := s.request(ctx, req)
+	if s.met != nil {
+		s.met.ObserveTransactionTotal(time.Since(start))
+	}
+	return env, err
+}
+
+func (s *Service) request(ctx context.Context, req *pb.Envelope) (*pb.Envelope, error) {
 	if s == nil || s.mgr == nil || s.router == nil || s.transport == nil {
 		return nil, fmt.Errorf("%w: service is not configured", ErrInvalidRequest)
 	}
@@ -76,6 +90,7 @@ func (s *Service) Request(ctx context.Context, req *pb.Envelope) (*pb.Envelope, 
 	defer cancel()
 
 	log := txLog()
+	dbg := log.Core().Enabled(zap.DebugLevel)
 	var exclude []uint32
 	var lastErr error
 
@@ -96,70 +111,83 @@ func (s *Service) Request(ctx context.Context, req *pb.Envelope) (*pb.Envelope, 
 			return nil, err
 		}
 		req.TransactionId = id
-		log.Debug("tx create",
-			zap.Uint64("transaction_id", id),
-			zap.Int("attempt", attempt+1),
-			zap.Uint32("message_id", req.GetDataRequest().GetMessageId()),
-			zap.String("session_id", req.GetDataRequest().GetSessionId()),
-			zap.String("trace_id", req.GetTraceId()),
-			zap.Int("payload_bytes", len(req.GetDataRequest().GetPayload())),
-		)
+		// Debug fields (kể cả addr.String) chỉ build khi level bật — tránh ~GB alloc/phút @ ~9k TPS.
+		if dbg {
+			log.Debug("tx create",
+				zap.Uint64("transaction_id", id),
+				zap.Int("attempt", attempt+1),
+				zap.Uint32("message_id", req.GetDataRequest().GetMessageId()),
+				zap.String("session_id", req.GetDataRequest().GetSessionId()),
+				zap.String("trace_id", req.GetTraceId()),
+				zap.Int("payload_bytes", len(req.GetDataRequest().GetPayload())),
+			)
+		}
 
 		node, err := s.route(reqCtx, req, exclude...)
 		if err != nil {
-			log.Debug("tx route thất bại", zap.Uint64("transaction_id", id), zap.Error(err))
+			if dbg {
+				log.Debug("tx route thất bại", zap.Uint64("transaction_id", id), zap.Error(err))
+			}
 			_ = s.mgr.Cancel(id)
 			return nil, err
 		}
 		req.DestinationNodeId = node.ID
 		addr, err := udpAddr(node)
 		if err != nil {
-			log.Debug("tx addr thất bại", zap.Uint64("transaction_id", id), zap.Uint32("node_id", node.ID), zap.Error(err))
+			if dbg {
+				log.Debug("tx addr thất bại", zap.Uint64("transaction_id", id), zap.Uint32("node_id", node.ID), zap.Error(err))
+			}
 			_ = s.mgr.Cancel(id)
 			return nil, err
 		}
-		log.Debug("tx route", zap.Uint64("transaction_id", id), zap.Uint32("node_id", node.ID), zap.String("udp", addr.String()), zap.Int("attempt", attempt+1))
+		if dbg {
+			log.Debug("tx route", zap.Uint64("transaction_id", id), zap.Uint32("node_id", node.ID), zap.String("udp", addr.String()), zap.Int("attempt", attempt+1))
+		}
 
 		if err := s.transport.Send(reqCtx, req, addr); err != nil {
-			log.Debug("tx send thất bại", zap.Uint64("transaction_id", id), zap.String("udp", addr.String()), zap.Error(err))
+			if dbg {
+				log.Debug("tx send thất bại", zap.Uint64("transaction_id", id), zap.String("udp", addr.String()), zap.Error(err))
+			}
+			if s.met != nil {
+				s.met.AddGWUDPSendError(1)
+			}
 			_ = s.mgr.Cancel(id)
 			lastErr = err
 			exclude = appendUnique(exclude, node.ID)
 			if attempt+1 < maxRouteAttempts {
+				if s.met != nil {
+					s.met.AddFailoverRetry(1)
+				}
 				log.Info("tx failover sau send fail", zap.Uint32("exclude_node_id", node.ID), zap.Int("next_attempt", attempt+2))
 				continue
 			}
 			return nil, err
 		}
-		log.Debug("tx send", zap.Uint64("transaction_id", id), zap.String("udp", addr.String()))
+		if s.met != nil {
+			s.met.AddGWUDPDataRequestTX(1)
+		}
+		s.observeRouted(node)
+		if dbg {
+			log.Debug("tx send", zap.Uint64("transaction_id", id), zap.String("udp", addr.String()))
+		}
 
-		waitCtx := reqCtx
-		var waitCancel context.CancelFunc
-		if attempt == 0 && maxRouteAttempts > 1 {
-			half := s.timeout / 2
-			if half >= 50*time.Millisecond {
-				waitCtx, waitCancel = context.WithTimeout(reqCtx, half)
-			}
-		}
-		env, err := s.mgr.Wait(waitCtx, id)
-		if waitCancel != nil {
-			waitCancel()
-		}
+		// Wait full transaction budget — không cắt nửa + failover (Case B / 1 CPU).
+		env, err := s.mgr.Wait(reqCtx, id)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				log.Debug("tx timeout", zap.Uint64("transaction_id", id), zap.Uint32("node_id", node.ID))
-				lastErr = ErrTransactionTimeout
-				exclude = appendUnique(exclude, node.ID)
-				if attempt+1 < maxRouteAttempts && reqCtx.Err() == nil {
-					log.Info("tx failover sau timeout", zap.Uint32("exclude_node_id", node.ID), zap.Int("next_attempt", attempt+2))
-					continue
+				if dbg {
+					log.Debug("tx timeout", zap.Uint64("transaction_id", id), zap.Uint32("node_id", node.ID))
 				}
 				return nil, ErrTransactionTimeout
 			}
-			log.Debug("tx wait thất bại", zap.Uint64("transaction_id", id), zap.Error(err))
+			if dbg {
+				log.Debug("tx wait thất bại", zap.Uint64("transaction_id", id), zap.Error(err))
+			}
 			return nil, err
 		}
-		log.Debug("tx complete", zap.Uint64("transaction_id", id), zap.Uint32("status", dataStatus(env)), zap.Int("attempt", attempt+1))
+		if dbg {
+			log.Debug("tx complete", zap.Uint64("transaction_id", id), zap.Uint32("status", dataStatus(env)), zap.Int("attempt", attempt+1))
+		}
 		return env, nil
 	}
 	if lastErr != nil {
@@ -177,6 +205,17 @@ func (s *Service) route(ctx context.Context, req *pb.Envelope, exclude ...uint32
 	return s.router.Route(ctx, req)
 }
 
+func (s *Service) observeRouted(node *registry.Node) {
+	if s == nil || s.met == nil || node == nil {
+		return
+	}
+	name := node.Name
+	if name == "" {
+		name = node.InstanceID
+	}
+	s.met.AddLogicRouted(node.ID, name)
+}
+
 func appendUnique(ids []uint32, id uint32) []uint32 {
 	for _, x := range ids {
 		if x == id {
@@ -186,28 +225,65 @@ func appendUnique(ids []uint32, id uint32) []uint32 {
 	return append(ids, id)
 }
 
-// OnResponse chỉ nhận DATA_RESPONSE rồi Complete theo transaction_id.
+// OnResponse nhận DATA_RESPONSE (thành công) hoặc MESSAGE_TYPE_ERROR (lỗi Logic) rồi Complete/Fail.
 func (s *Service) OnResponse(env *pb.Envelope) error {
 	if s == nil || s.mgr == nil {
 		return fmt.Errorf("%w: service is not configured", ErrInvalidRequest)
 	}
-	if env == nil || env.GetType() != pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE {
-		return fmt.Errorf("%w: require DATA_RESPONSE", ErrInvalidResponse)
+	if env == nil {
+		return fmt.Errorf("%w: nil envelope", ErrInvalidResponse)
 	}
 	if env.GetTransactionId() == 0 {
 		return fmt.Errorf("%w: missing transaction_id", ErrInvalidResponse)
 	}
-	err := s.mgr.Complete(env.GetTransactionId(), env)
-	if err != nil {
-		txLog().Debug("tx on_response thất bại", zap.Uint64("transaction_id", env.GetTransactionId()), zap.Error(err))
-		return err
+	log := txLog()
+	dbg := log.Core().Enabled(zap.DebugLevel)
+	switch env.GetType() {
+	case pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE:
+		err := s.mgr.Complete(env.GetTransactionId(), env)
+		if err != nil {
+			if dbg {
+				log.Debug("tx on_response thất bại", zap.Uint64("transaction_id", env.GetTransactionId()), zap.Error(err))
+			}
+			return err
+		}
+		if dbg {
+			log.Debug("tx on_response", zap.Uint64("transaction_id", env.GetTransactionId()), zap.Uint32("status", dataStatus(env)))
+		}
+		return nil
+	case pb.MessageType_MESSAGE_TYPE_ERROR:
+		le := LogicErrorFromProto(env.GetError())
+		err := s.mgr.Fail(env.GetTransactionId(), le)
+		if err != nil {
+			if dbg {
+				log.Debug("tx on_error thất bại", zap.Uint64("transaction_id", env.GetTransactionId()), zap.Error(err))
+			}
+			return err
+		}
+		if dbg {
+			log.Debug("tx on_error",
+				zap.Uint64("transaction_id", env.GetTransactionId()),
+				zap.String("code", le.Code.String()),
+				zap.String("message", le.Message),
+			)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: require DATA_RESPONSE or ERROR", ErrInvalidResponse)
 	}
-	txLog().Debug("tx on_response", zap.Uint64("transaction_id", env.GetTransactionId()), zap.Uint32("status", dataStatus(env)))
-	return nil
 }
 
+var (
+	txLoggerOnce sync.Once
+	txLogger     *zap.Logger
+)
+
+// txLog cache Named("transaction") — zap.L().Named clone logger mỗi lần gọi.
 func txLog() *zap.Logger {
-	return zap.L().Named("transaction")
+	txLoggerOnce.Do(func() {
+		txLogger = zap.L().Named("transaction")
+	})
+	return txLogger
 }
 
 func dataStatus(env *pb.Envelope) uint32 {

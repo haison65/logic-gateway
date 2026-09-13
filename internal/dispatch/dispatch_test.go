@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/haison65/logic-gateway/internal/heartbeat"
+	"github.com/haison65/logic-gateway/internal/metrics"
 	"github.com/haison65/logic-gateway/internal/registration"
 	"github.com/haison65/logic-gateway/internal/registry"
 	"github.com/haison65/logic-gateway/internal/transport/udp"
@@ -40,7 +41,7 @@ func TestDispatcherRegisterAndHeartbeat(t *testing.T) {
 	logic := newUDP(t)
 	reg := registry.NewMemory()
 	comp := &recCompleter{ch: make(chan *pb.Envelope, 1)}
-	d, err := New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), comp, zap.NewNop(), nil, nil)
+	d, err := New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), comp, zap.NewNop(), nil, nil, Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +110,111 @@ func TestDispatcherRegisterAndHeartbeat(t *testing.T) {
 	}
 }
 
+func TestDispatcherErrorEnvelopeCompletes(t *testing.T) {
+	t.Parallel()
+	gw := newUDP(t)
+	logic := newUDP(t)
+	reg := registry.NewMemory()
+	comp := &recCompleter{ch: make(chan *pb.Envelope, 1)}
+	d, err := New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), comp, zap.NewNop(), nil, nil, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = d.Run(ctx) }()
+
+	errEnv := &pb.Envelope{
+		Type:          pb.MessageType_MESSAGE_TYPE_ERROR,
+		TransactionId: 77,
+		Body: &pb.Envelope_Error{Error: &pb.ErrorMessage{
+			Code:    pb.ErrorCode_ERROR_CODE_OVERLOAD,
+			Message: "busy",
+		}},
+	}
+	if err := logic.Send(ctx, errEnv, gw.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case env := <-comp.ch:
+		if env.GetType() != pb.MessageType_MESSAGE_TYPE_ERROR || env.GetTransactionId() != 77 {
+			t.Fatalf("got %+v", env)
+		}
+	case <-ctx.Done():
+		t.Fatal("OnResponse not called for ERROR")
+	}
+}
+
+func TestConfigNormalizedDefaults(t *testing.T) {
+	t.Parallel()
+	got := (Config{}).normalized()
+	if got.InboundQueueSize != defaultInboundQueueSize || got.InboundWorkers != defaultInboundWorkers {
+		t.Fatalf("defaults = %+v", got)
+	}
+	got = (Config{InboundQueueSize: 100, InboundWorkers: 4}).normalized()
+	if got.InboundQueueSize != 100 || got.InboundWorkers != 4 {
+		t.Fatalf("custom = %+v", got)
+	}
+}
+
+func TestInboundQueueDropsWhenFull(t *testing.T) {
+	t.Parallel()
+	gw := newUDP(t)
+	logic := newUDP(t)
+	reg := registry.NewMemory()
+	block := make(chan struct{})
+	comp := &blockingCompleter{block: block}
+	met := metrics.New()
+	d, err := New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), comp, zap.NewNop(), nil, met, Config{
+		InboundQueueSize: 1,
+		InboundWorkers:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = d.Run(ctx) }()
+
+	addr := gw.LocalAddr().(*net.UDPAddr)
+	// First response occupies the single worker (blocked in Complete).
+	first := &pb.Envelope{
+		Type:          pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE,
+		TransactionId: 1,
+		Body:          &pb.Envelope_DataResponse{DataResponse: &pb.DataResponse{MessageId: 1001}},
+	}
+	if err := logic.Send(ctx, first, addr); err != nil {
+		t.Fatal(err)
+	}
+	// Fill the 1-slot queue + overflow a few packets while worker blocked.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		env := &pb.Envelope{
+			Type:          pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE,
+			TransactionId: uint64(time.Now().UnixNano()),
+			Body:          &pb.Envelope_DataResponse{DataResponse: &pb.DataResponse{MessageId: 1001}},
+		}
+		_ = logic.Send(ctx, env, addr)
+		snap := met.Snapshot()
+		if snap.UDPResponseDroppedTotal > 0 && snap.UDPResponseQueueFullTotal > 0 {
+			close(block)
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(block)
+	t.Fatalf("expected queue drops, got %+v", met.Snapshot())
+}
+
+type blockingCompleter struct {
+	block chan struct{}
+}
+
+func (c *blockingCompleter) OnResponse(*pb.Envelope) error {
+	<-c.block
+	return nil
+}
+
 type fakeOutbound struct {
 	data *pb.DataResponse
 	err  error
@@ -127,7 +233,7 @@ func TestDispatcherOutboundHTTPSuccess(t *testing.T) {
 	reg := registry.NewMemory()
 	comp := &recCompleter{ch: make(chan *pb.Envelope, 1)}
 	ob := fakeOutbound{data: &pb.DataResponse{MessageId: 1001, Status: 200, Payload: []byte("remote")}}
-	d, err := New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), comp, zap.NewNop(), ob, nil)
+	d, err := New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), comp, zap.NewNop(), ob, nil, Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +289,7 @@ func TestDispatcherOutboundHTTPStatusesAndErrors(t *testing.T) {
 			logic := newUDP(t)
 			reg := registry.NewMemory()
 			comp := &recCompleter{ch: make(chan *pb.Envelope, 1)}
-			d, err := New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), comp, zap.NewNop(), tc.ob, nil)
+			d, err := New(1, gw, registration.NewService(reg), heartbeat.NewService(reg, nil), comp, zap.NewNop(), tc.ob, nil, Config{})
 			if err != nil {
 				t.Fatal(err)
 			}
