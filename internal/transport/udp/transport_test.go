@@ -387,15 +387,205 @@ func TestCodecRoundTrip(t *testing.T) {
 			HeartbeatRequest: &pb.HeartbeatRequest{NodeId: 1, Sequence: 2},
 		},
 	}
-	wire, err := encode(original)
+	wire, release, err := encode(original)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
+	defer release()
 	got, err := decode(wire)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
+	defer ReleaseEnvelope(got)
 	if !proto.Equal(original, got) {
 		t.Fatal("codec round-trip mismatch")
+	}
+}
+
+func TestBufferApplyReportPopulated(t *testing.T) {
+	t.Parallel()
+	want := 1 << 20 // 1 MiB request (may clamp on host)
+	c, err := New(Config{
+		ListenHost:      "127.0.0.1",
+		ListenPort:      0,
+		ReadBufferSize:  want,
+		WriteBufferSize: want,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	rep := c.BufferApplyReport()
+	if rep.ConfiguredRcvbuf != want || rep.RequestedRcvbuf != want {
+		t.Fatalf("configured/requested = %d/%d want %d", rep.ConfiguredRcvbuf, rep.RequestedRcvbuf, want)
+	}
+	// After apply, after_force should be set on platforms that support getsockopt.
+	if rep.ActualRcvbufAfterForce == 0 && rep.ActualRcvbufBeforeForce == 0 && rep.ForceError == nil {
+		t.Log("socket buffer sizes unavailable on this OS; report fields still recorded configured")
+	}
+}
+
+func TestReceiveRawThenDecode(t *testing.T) {
+	t.Parallel()
+	receiver := newLoopback(t)
+	sender := newLoopback(t)
+	original := &pb.Envelope{
+		Version:       1,
+		Type:          pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE,
+		TransactionId: 42,
+		Body: &pb.Envelope_DataResponse{
+			DataResponse: &pb.DataResponse{MessageId: 7, Payload: []byte("raw-path")},
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	var pkt []byte
+	var from *net.UDPAddr
+	go func() {
+		var err error
+		pkt, from, err = receiver.ReceiveRaw(ctx)
+		errCh <- err
+	}()
+	if err := sender.Send(ctx, original, udpAddr(t, receiver.LocalAddr())); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("ReceiveRaw: %v", err)
+	}
+	defer ReleasePacket(pkt)
+	if from == nil || len(pkt) == 0 {
+		t.Fatalf("empty raw packet from=%v len=%d", from, len(pkt))
+	}
+	got, err := DecodeEnvelope(pkt)
+	if err != nil {
+		t.Fatalf("DecodeEnvelope: %v", err)
+	}
+	if !proto.Equal(original, got) {
+		t.Fatalf("mismatch\nwant=%v\ngot=%v", original, got)
+	}
+}
+
+func TestReceiveRawBatch(t *testing.T) {
+	t.Parallel()
+	receiver := newLoopback(t)
+	sender := newLoopback(t)
+	dst := udpAddr(t, receiver.LocalAddr())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	const n = 3
+	for i := 0; i < n; i++ {
+		msg := &pb.Envelope{
+			Version:       1,
+			Type:          pb.MessageType_MESSAGE_TYPE_DATA_RESPONSE,
+			TransactionId: uint64(100 + i),
+			Body: &pb.Envelope_DataResponse{
+				DataResponse: &pb.DataResponse{MessageId: uint32(i + 1), Payload: []byte("batch")},
+			},
+		}
+		if err := sender.Send(ctx, msg, dst); err != nil {
+			t.Fatalf("Send[%d]: %v", i, err)
+		}
+	}
+
+	got := 0
+	deadline := time.Now().Add(2 * time.Second)
+	for got < n && time.Now().Before(deadline) {
+		pkts, addrs, err := receiver.ReceiveRawBatch(ctx, 8)
+		if err != nil {
+			t.Fatalf("ReceiveRawBatch: %v", err)
+		}
+		if len(pkts) != len(addrs) {
+			t.Fatalf("len mismatch pkts=%d addrs=%d", len(pkts), len(addrs))
+		}
+		for _, pkt := range pkts {
+			_, err := DecodeEnvelope(pkt)
+			ReleasePacket(pkt)
+			if err != nil {
+				t.Fatalf("DecodeEnvelope: %v", err)
+			}
+			got++
+		}
+	}
+	if got != n {
+		t.Fatalf("got %d packets want %d", got, n)
+	}
+}
+
+func TestSendBatcherPooledErrCh(t *testing.T) {
+	t.Parallel()
+	receiver, err := New(Config{ListenHost: "127.0.0.1", ListenPort: 0, ReadPollInterval: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = receiver.Close() })
+	sender, err := New(Config{
+		ListenHost:      "127.0.0.1",
+		ListenPort:      0,
+		SendBatchSize:   8,
+		SendBatchWait:   50 * time.Microsecond,
+		ReadPollInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sender.Close() })
+
+	dst := udpAddr(t, receiver.LocalAddr())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	const n = 32
+	for i := 0; i < n; i++ {
+		msg := &pb.Envelope{
+			Version:       1,
+			Type:          pb.MessageType_MESSAGE_TYPE_HEARTBEAT_REQUEST,
+			TransactionId: uint64(i + 1),
+			Body: &pb.Envelope_HeartbeatRequest{
+				HeartbeatRequest: &pb.HeartbeatRequest{NodeId: 1, Sequence: uint64(i + 1)},
+			},
+		}
+		if err := sender.Send(ctx, msg, dst); err != nil {
+			t.Fatalf("Send[%d]: %v", i, err)
+		}
+	}
+	for i := 0; i < n; i++ {
+		got, _, err := receiver.Receive(ctx)
+		if err != nil {
+			t.Fatalf("Receive[%d]: %v", i, err)
+		}
+		if got.GetHeartbeatRequest().GetSequence() != uint64(i+1) {
+			t.Fatalf("seq=%d want %d", got.GetHeartbeatRequest().GetSequence(), i+1)
+		}
+	}
+}
+
+func TestSendBatchSequential(t *testing.T) {
+	t.Parallel()
+	receiver := newLoopback(t)
+	sender := newLoopback(t)
+	dst := udpAddr(t, receiver.LocalAddr())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	items := []EnvelopeAndAddr{
+		{Msg: &pb.Envelope{Type: pb.MessageType_MESSAGE_TYPE_HEARTBEAT_REQUEST, TransactionId: 1,
+			Body: &pb.Envelope_HeartbeatRequest{HeartbeatRequest: &pb.HeartbeatRequest{NodeId: 1, Sequence: 1}}}, Addr: dst},
+		{Msg: &pb.Envelope{Type: pb.MessageType_MESSAGE_TYPE_HEARTBEAT_REQUEST, TransactionId: 2,
+			Body: &pb.Envelope_HeartbeatRequest{HeartbeatRequest: &pb.HeartbeatRequest{NodeId: 1, Sequence: 2}}}, Addr: dst},
+	}
+	if err := sender.SendBatch(ctx, items); err != nil {
+		t.Fatalf("SendBatch: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		got, _, err := receiver.Receive(ctx)
+		if err != nil {
+			t.Fatalf("Receive[%d]: %v", i, err)
+		}
+		if got.GetHeartbeatRequest().GetSequence() != uint64(i+1) {
+			t.Fatalf("seq=%d want %d", got.GetHeartbeatRequest().GetSequence(), i+1)
+		}
 	}
 }
